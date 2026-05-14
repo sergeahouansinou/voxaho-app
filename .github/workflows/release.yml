@@ -6,6 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# Donne au GITHUB_TOKEN l'autorisation de créer/modifier les releases
+permissions:
+  contents: write
+
 jobs:
   # ── macOS build ────────────────────────────────────────────────────────────
   build-macos:
