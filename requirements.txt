@@ -1,0 +1,10 @@
+faster-whisper>=1.0.0,<2.0.0
+sounddevice>=0.4.5
+numpy>=1.24.0
+PyQt6>=6.4.0,<7.0.0
+pyobjc-core>=9.0; sys_platform == 'darwin'
+pyobjc-framework-Quartz>=9.0; sys_platform == 'darwin'
+pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'
+pyautogui>=0.9.54
+pynput>=1.7.0; sys_platform == 'win32'
+pyperclip>=1.8.0; sys_platform == 'win32'

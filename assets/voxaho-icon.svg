@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <radialGradient id="dot-glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%"   stop-color="#30D158" stop-opacity="0.65"/>
+      <stop offset="55%"  stop-color="#30D158" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#30D158" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="bg-light" cx="0.5" cy="0.35" r="0.7">
+      <stop offset="0%"   stop-color="#1A1A24" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#07070D" stop-opacity="1"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Subtle gradient dark background -->
+  <rect width="1024" height="1024" rx="230" fill="url(#bg-light)"/>
+
+  <!-- Minimalist V monogram — single elegant stroke, rounded apex -->
+  <path d="M 245 240 L 512 745 L 779 240"
+        stroke="#FFFFFF"
+        stroke-width="118"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        fill="none"/>
+
+  <!-- Green pulse dot — brand signature, nestled in V's opening -->
+  <circle cx="512" cy="385" r="105" fill="url(#dot-glow)"/>
+  <circle cx="512" cy="385" r="40"  fill="#30D158"/>
+</svg>

@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 100" fill="none">
+  <defs>
+    <radialGradient id="dot-glow-wm" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%"   stop-color="#30D158" stop-opacity="0.65"/>
+      <stop offset="55%"  stop-color="#30D158" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#30D158" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Green pulse dot -->
+  <circle cx="38" cy="50" r="22" fill="url(#dot-glow-wm)"/>
+  <circle cx="38" cy="50" r="11" fill="#30D158"/>
+
+  <!-- Wordmark — VOXAHO uppercase, light weight, wide tracking (luxury feel) -->
+  <text
+    x="82" y="63"
+    font-family="Inter, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif"
+    font-weight="500"
+    font-size="42"
+    fill="#FFFFFF"
+    letter-spacing="10"
+  >VOXAHO</text>
+</svg>

@@ -1,0 +1,762 @@
+"""
+SettingsWindow — fenêtre de personnalisation complète de Voxaho.
+
+Panneau multi-section (sidebar gauche + contenu droite), ouvert depuis la barre
+flottante. Émet :
+  - settings_preview(dict) : sur changement immédiat (preview live)
+  - settings_applied(dict) : sur clic "Appliquer" (sauvegardé + appliqué)
+"""
+
+from __future__ import annotations
+
+import sys
+import logging
+import webbrowser
+from copy import deepcopy
+
+from PyQt6.QtWidgets import (
+    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QComboBox, QCheckBox, QLineEdit, QStackedWidget, QListWidget,
+    QListWidgetItem, QButtonGroup, QRadioButton, QSlider, QFrame,
+    QSpacerItem, QSizePolicy, QMessageBox,
+)
+from PyQt6.QtCore import Qt, pyqtSignal, QSize
+from PyQt6.QtGui import QFont, QColor
+
+logger = logging.getLogger(__name__)
+
+IS_MAC = sys.platform == "darwin"
+APP_VERSION = "1.0.0"
+
+
+# ── Palette accent (id → (label, hex)) ──────────────────────────────────────────
+ACCENTS = {
+    "blue":   ("Bleu",   "#0A84FF"),
+    "purple": ("Violet", "#BF5AF2"),
+    "green":  ("Vert",   "#30D158"),
+    "orange": ("Orange", "#FF9F0A"),
+    "pink":   ("Rose",   "#FF375F"),
+}
+
+MINI_SIZES = {"small": 30, "medium": 40, "large": 52}
+
+LANGS = [
+    ("fr",   "🇫🇷  Français"),
+    ("en",   "🇬🇧  English"),
+    ("es",   "🇪🇸  Español"),
+    ("de",   "🇩🇪  Deutsch"),
+    ("it",   "🇮🇹  Italiano"),
+    ("auto", "🌍  Auto"),
+]
+
+MODELS = [
+    ("tiny",     "Tiny",                 "≈ 0,3 s · 200 Mo · qualité basique"),
+    ("small",    "Small (recommandé)",   "≈ 0,8 s · 500 Mo · bon compromis"),
+    ("medium",   "Medium",               "≈ 1,5 s · 1,5 Go · meilleure qualité"),
+    ("large-v3", "Large v3",             "≈ 3 s · 3 Go · qualité maximale"),
+]
+
+WIN_KEYS = [
+    ("ctrl_r",    "Ctrl droit"),
+    ("ctrl_l",    "Ctrl gauche"),
+    ("alt_r",     "Alt droit"),
+    ("shift_r",   "Shift droit"),
+    ("caps_lock", "Verr. Maj."),
+]
+
+
+# ── Stylesheet global ───────────────────────────────────────────────────────────
+STYLESHEET = """
+QDialog { background-color: #1C1C1E; }
+QWidget#sidebar { background-color: #0D0D18; }
+QWidget#content { background-color: #1C1C1E; }
+QLabel { color: #FFFFFF; background: transparent;
+         font-family: -apple-system, "SF Pro Text", "Segoe UI", system-ui; }
+QLabel#title    { color: #FFFFFF; font-size: 19px; font-weight: 600; }
+QLabel#subtitle { color: #8E8E93; font-size: 12px; }
+QLabel#section  { color: #EBEBF5; font-size: 11px; font-weight: 700;
+                  letter-spacing: 1.2px; text-transform: uppercase; }
+QLabel#hint     { color: #636366; font-size: 11px; }
+QLabel#desc     { color: #8E8E93; font-size: 12px; }
+QLabel#link     { color: #0A84FF; font-size: 12px; text-decoration: underline; }
+QLabel#license-ok    { color: #30D158; font-size: 13px; font-weight: 600; }
+QLabel#license-trial { color: #FF9F0A; font-size: 13px; font-weight: 600; }
+QLabel#license-exp   { color: #FF453A; font-size: 13px; font-weight: 600; }
+
+QListWidget#nav {
+    background: transparent; border: none; outline: none;
+    color: #EBEBF5; font-size: 13px;
+    font-family: -apple-system, "SF Pro Text", system-ui;
+    padding-top: 18px;
+}
+QListWidget#nav::item {
+    padding: 11px 18px; margin: 2px 10px; border-radius: 8px;
+    border-left: 2px solid transparent;
+}
+QListWidget#nav::item:hover    { background: rgba(255,255,255,0.06); }
+QListWidget#nav::item:selected { background: rgba(10,132,255,0.15);
+                                  border-left: 2px solid #0A84FF;
+                                  color: #FFFFFF; }
+
+QComboBox, QLineEdit {
+    background-color: #2C2C2E; color: #FFFFFF;
+    border: 1px solid #3A3A3C; border-radius: 8px;
+    padding: 9px 12px; font-size: 13px;
+    font-family: -apple-system, "SF Pro Text", system-ui;
+}
+QComboBox:focus, QLineEdit:focus { border: 1px solid #0A84FF; }
+QComboBox::drop-down { border: none; padding-right: 12px; }
+QComboBox QAbstractItemView {
+    background-color: #2C2C2E; color: #FFFFFF;
+    border: 1px solid #3A3A3C;
+    selection-background-color: #0A84FF;
+}
+QComboBox:disabled, QLineEdit:disabled { color: #636366; background: #232325; }
+
+QCheckBox { color: #FFFFFF; font-size: 13px; spacing: 10px; }
+QCheckBox::indicator {
+    width: 36px; height: 20px; border-radius: 10px;
+    background: #3A3A3C; border: none;
+}
+QCheckBox::indicator:checked { background: #30D158; }
+
+QRadioButton { color: #EBEBF5; font-size: 13px; spacing: 8px; padding: 3px 0; }
+QRadioButton::indicator {
+    width: 16px; height: 16px; border-radius: 8px;
+    border: 1.5px solid #636366; background: #2C2C2E;
+}
+QRadioButton::indicator:checked {
+    background: #0A84FF; border: 4px solid #0A84FF;
+    width: 8px; height: 8px;
+}
+
+QPushButton {
+    background-color: #2C2C2E; color: #EBEBF5;
+    border: 1px solid #3A3A3C; border-radius: 8px;
+    padding: 9px 16px; font-size: 13px;
+    font-family: -apple-system, "SF Pro Text", system-ui;
+}
+QPushButton:hover    { background-color: #38383A; }
+QPushButton:disabled { color: #636366; }
+
+QPushButton#primary {
+    background-color: #0A84FF; color: #FFFFFF; border: none;
+    border-radius: 10px; padding: 11px 22px;
+    font-size: 13px; font-weight: 600;
+}
+QPushButton#primary:hover    { background-color: #409CFF; }
+QPushButton#primary:disabled { background-color: #3A3A3C; color: #636366; }
+
+QPushButton#ghost {
+    background-color: transparent; color: #EBEBF5;
+    border: 1px solid #3A3A3C; border-radius: 10px;
+    padding: 11px 22px; font-size: 13px; font-weight: 500;
+}
+QPushButton#ghost:hover { background-color: rgba(255,255,255,0.05); }
+
+QPushButton#danger {
+    background-color: transparent; color: #FF453A;
+    border: 1px solid rgba(255,69,58,0.4); border-radius: 8px;
+}
+QPushButton#danger:hover { background-color: rgba(255,69,58,0.1); }
+
+QSlider::groove:horizontal {
+    height: 4px; background: #3A3A3C; border-radius: 2px;
+}
+QSlider::sub-page:horizontal { background: #0A84FF; border-radius: 2px; }
+QSlider::handle:horizontal {
+    background: #FFFFFF; width: 16px; height: 16px;
+    margin: -6px 0; border-radius: 8px;
+}
+
+QFrame#sep { background: #2C2C2E; max-height: 1px; border: none; }
+"""
+
+
+# ── Swatch couleur cliquable ────────────────────────────────────────────────────
+class ColorSwatch(QPushButton):
+    """Bouton circulaire coloré sélectionnable."""
+
+    def __init__(self, accent_id: str, hex_color: str, parent=None):
+        super().__init__(parent)
+        self.accent_id = accent_id
+        self.hex_color = hex_color
+        self.setFixedSize(28, 28)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._restyle()
+
+    def _restyle(self):
+        ring = "#FFFFFF" if self.isChecked() else "transparent"
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {self.hex_color};
+                border: 2px solid {ring};
+                border-radius: 14px;
+            }}
+            QPushButton:hover {{ border: 2px solid rgba(255,255,255,0.6); }}
+        """)
+
+    def setChecked(self, checked: bool):
+        super().setChecked(checked)
+        self._restyle()
+
+
+# ── Fenêtre principale ──────────────────────────────────────────────────────────
+class SettingsWindow(QDialog):
+
+    settings_applied = pyqtSignal(dict)
+    settings_preview = pyqtSignal(dict)
+
+    def __init__(self, config: dict, save_config_fn):
+        super().__init__()
+        self._original_config = deepcopy(config)
+        self.config = deepcopy(config)
+        self._save_config = save_config_fn
+        self._building = True  # gate les signaux pendant la construction
+
+        self._setup_ui()
+        self._load_values()
+        self._building = False
+
+    # ── UI scaffold ──────────────────────────────────────────────────────────
+    def _setup_ui(self):
+        self.setWindowTitle("Voxaho — Préférences")
+        self.setFixedSize(580, 640)
+        self.setStyleSheet(STYLESHEET)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.WindowCloseButtonHint
+        )
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Sidebar
+        sidebar = QWidget(objectName="sidebar")
+        sidebar.setFixedWidth(160)
+        sb_lay = QVBoxLayout(sidebar)
+        sb_lay.setContentsMargins(0, 0, 0, 0)
+        sb_lay.setSpacing(0)
+
+        self.nav = QListWidget(objectName="nav")
+        self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        for label in ["⚙   Général", "🧠  Modèle", "⌨   Touche",
+                      "🎨  Apparence", "🔑  Licence", "ℹ   À propos"]:
+            it = QListWidgetItem(label)
+            it.setSizeHint(QSize(0, 40))
+            self.nav.addItem(it)
+        sb_lay.addWidget(self.nav)
+        root.addWidget(sidebar)
+
+        # Contenu droite
+        right = QWidget(objectName="content")
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(28, 24, 28, 20)
+        right_lay.setSpacing(16)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_general_tab())
+        self.stack.addWidget(self._build_model_tab())
+        self.stack.addWidget(self._build_hotkey_tab())
+        self.stack.addWidget(self._build_appearance_tab())
+        self.stack.addWidget(self._build_license_tab())
+        self.stack.addWidget(self._build_about_tab())
+        right_lay.addWidget(self.stack, 1)
+
+        # Boutons bas
+        sep = QFrame(objectName="sep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        right_lay.addWidget(sep)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel = QPushButton("Annuler", objectName="ghost")
+        cancel.clicked.connect(self._on_cancel)
+        apply_ = QPushButton("Appliquer", objectName="primary")
+        apply_.clicked.connect(self._on_apply)
+        btn_row.addWidget(cancel)
+        btn_row.addSpacing(8)
+        btn_row.addWidget(apply_)
+        right_lay.addLayout(btn_row)
+
+        root.addWidget(right, 1)
+
+        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.setCurrentRow(0)
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    def _tab_container(self, title: str, subtitle: str = "") -> tuple[QWidget, QVBoxLayout]:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+        t = QLabel(title, objectName="title")
+        lay.addWidget(t)
+        if subtitle:
+            s = QLabel(subtitle, objectName="subtitle")
+            lay.addWidget(s)
+        lay.addSpacing(6)
+        return w, lay
+
+    def _section_label(self, text: str) -> QLabel:
+        return QLabel(text, objectName="section")
+
+    # ── Onglet 1 : Général ───────────────────────────────────────────────────
+    def _build_general_tab(self) -> QWidget:
+        w, lay = self._tab_container("Général", "Langue, reformatage et démarrage")
+
+        lay.addWidget(self._section_label("Langue de dictée"))
+        self.cb_lang = QComboBox()
+        for code, label in LANGS:
+            self.cb_lang.addItem(label, code)
+        self.cb_lang.currentIndexChanged.connect(self._emit_preview)
+        lay.addWidget(self.cb_lang)
+
+        lay.addSpacing(8)
+        lay.addWidget(self._section_label("Reformatage IA"))
+        self.ck_reformat = QCheckBox("  Activer le reformatage automatique")
+        self.ck_reformat.stateChanged.connect(self._emit_preview)
+        lay.addWidget(self.ck_reformat)
+        hint = QLabel("Ajoute ponctuation, majuscules et corrige les erreurs courantes.",
+                      objectName="desc")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        lay.addSpacing(12)
+        lay.addWidget(self._section_label("Démarrage automatique"))
+        self.ck_autostart = QCheckBox("  Lancer Voxaho à l'ouverture de session")
+        from core import autostart
+        if autostart.is_supported():
+            self.ck_autostart.setChecked(autostart.is_enabled())
+            self.ck_autostart.stateChanged.connect(self._on_autostart_toggle)
+            hint_txt = "Voxaho démarrera silencieusement à chaque connexion."
+        else:
+            self.ck_autostart.setEnabled(False)
+            hint_txt = "Non disponible sur cette plateforme."
+        lay.addWidget(self.ck_autostart)
+        self.lb_autostart_hint = QLabel(hint_txt, objectName="hint")
+        self.lb_autostart_hint.setWordWrap(True)
+        lay.addWidget(self.lb_autostart_hint)
+
+        lay.addStretch(1)
+        return w
+
+    # ── Onglet 2 : Modèle ────────────────────────────────────────────────────
+    def _build_model_tab(self) -> QWidget:
+        w, lay = self._tab_container("Modèle Whisper", "Choisir la précision de la transcription")
+
+        lay.addWidget(self._section_label("Modèle"))
+        self.cb_model = QComboBox()
+        for code, label, _ in MODELS:
+            self.cb_model.addItem(label, code)
+        self.cb_model.currentIndexChanged.connect(self._on_model_change)
+        lay.addWidget(self.cb_model)
+
+        self.lb_model_desc = QLabel("", objectName="desc")
+        self.lb_model_desc.setWordWrap(True)
+        lay.addWidget(self.lb_model_desc)
+
+        lay.addSpacing(16)
+        redl = QPushButton("Re-télécharger le modèle")
+        redl.clicked.connect(self._on_redownload)
+        lay.addWidget(redl, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        lay.addStretch(1)
+        return w
+
+    def _on_model_change(self):
+        idx = self.cb_model.currentIndex()
+        if 0 <= idx < len(MODELS):
+            self.lb_model_desc.setText(MODELS[idx][2])
+        self._emit_preview()
+
+    def _on_redownload(self):
+        QMessageBox.information(
+            self, "Re-télécharger",
+            "Pour re-télécharger le modèle, supprimez le dossier ~/.cache/huggingface\n"
+            "puis relancez Voxaho.",
+        )
+
+    def _on_autostart_toggle(self, state):
+        from core import autostart
+        wanted = self.ck_autostart.isChecked()
+        ok = autostart.set_enabled(wanted)
+        if not ok:
+            # Restaure la coche à l'état réel et préviens
+            self.ck_autostart.blockSignals(True)
+            self.ck_autostart.setChecked(autostart.is_enabled())
+            self.ck_autostart.blockSignals(False)
+            QMessageBox.warning(
+                self, "Démarrage automatique",
+                "Impossible de modifier le démarrage automatique.\n"
+                "Vérifiez les permissions de ~/Library/LaunchAgents (macOS) "
+                "ou du registre (Windows).",
+            )
+            return
+        # Feedback visuel discret
+        if wanted:
+            self.lb_autostart_hint.setText("✓ Voxaho se lancera à votre prochaine session.")
+        else:
+            self.lb_autostart_hint.setText("Voxaho ne démarrera plus automatiquement.")
+
+    # ── Onglet 3 : Touche ────────────────────────────────────────────────────
+    def _build_hotkey_tab(self) -> QWidget:
+        w, lay = self._tab_container("Touche déclencheur",
+                                      "Maintenez cette touche pour dicter")
+
+        lay.addWidget(self._section_label("Touche"))
+        if IS_MAC:
+            ro = QLineEdit("Fn (non modifiable sur macOS)")
+            ro.setReadOnly(True)
+            ro.setDisabled(True)
+            lay.addWidget(ro)
+            help_ = QLabel(
+                "Sur macOS, Voxaho utilise la touche Fn (Globe) via une autorisation "
+                "Accessibilité. Cette touche n'est pas reconfigurable.",
+                objectName="desc",
+            )
+            help_.setWordWrap(True)
+            lay.addWidget(help_)
+        else:
+            self.cb_winkey = QComboBox()
+            for code, label in WIN_KEYS:
+                self.cb_winkey.addItem(label, code)
+            self.cb_winkey.currentIndexChanged.connect(self._emit_preview)
+            lay.addWidget(self.cb_winkey)
+            help_ = QLabel(
+                "Maintenez cette touche pendant que vous parlez. Relâchez pour transcrire.",
+                objectName="desc",
+            )
+            help_.setWordWrap(True)
+            lay.addWidget(help_)
+
+        lay.addStretch(1)
+        return w
+
+    # ── Onglet 4 : Apparence ─────────────────────────────────────────────────
+    def _build_appearance_tab(self) -> QWidget:
+        w, lay = self._tab_container("Apparence", "Position, couleur et taille")
+
+        lay.addWidget(self._section_label("Position de la barre"))
+        self.bg_pos = QButtonGroup(self)
+        for code, label in [("top", "Haut centre"),
+                             ("bottom", "Bas centre"),
+                             ("custom", "Position personnalisée (glisser-déposer)")]:
+            rb = QRadioButton(label)
+            rb.setProperty("pos_code", code)
+            rb.toggled.connect(self._emit_preview)
+            self.bg_pos.addButton(rb)
+            lay.addWidget(rb)
+
+        lay.addSpacing(12)
+        lay.addWidget(self._section_label("Couleur d'accent"))
+        swatch_row = QHBoxLayout()
+        swatch_row.setSpacing(10)
+        self.swatches: list[ColorSwatch] = []
+        for acc_id, (lab, hex_c) in ACCENTS.items():
+            s = ColorSwatch(acc_id, hex_c)
+            s.setToolTip(lab)
+            s.clicked.connect(lambda _=False, sw=s: self._on_swatch(sw))
+            swatch_row.addWidget(s)
+            self.swatches.append(s)
+        swatch_row.addStretch(1)
+        lay.addLayout(swatch_row)
+
+        lay.addSpacing(12)
+        lay.addWidget(self._section_label("Taille de la barre minimale"))
+        size_row = QHBoxLayout()
+        size_row.setSpacing(12)
+        self.sl_size = QSlider(Qt.Orientation.Horizontal)
+        self.sl_size.setRange(0, 2)
+        self.sl_size.setTickInterval(1)
+        self.sl_size.valueChanged.connect(self._on_size_change)
+        self.lb_size = QLabel("Medium", objectName="desc")
+        self.lb_size.setMinimumWidth(60)
+        size_row.addWidget(self.sl_size, 1)
+        size_row.addWidget(self.lb_size)
+        lay.addLayout(size_row)
+
+        lay.addSpacing(12)
+        lay.addWidget(self._section_label("Visibilité"))
+        self.ck_autohide = QCheckBox("  Masquer automatiquement après 5 s d'inactivité")
+        self.ck_autohide.stateChanged.connect(self._emit_preview)
+        lay.addWidget(self.ck_autohide)
+
+        lay.addStretch(1)
+        return w
+
+    def _on_swatch(self, clicked: ColorSwatch):
+        for s in self.swatches:
+            s.setChecked(s is clicked)
+        self._emit_preview()
+
+    def _on_size_change(self, v: int):
+        self.lb_size.setText(["Small", "Medium", "Large"][v])
+        self._emit_preview()
+
+    # ── Onglet 5 : Licence ───────────────────────────────────────────────────
+    def _build_license_tab(self) -> QWidget:
+        w, lay = self._tab_container("Licence", "Statut et activation")
+
+        self.lb_lic_status = QLabel("", objectName="license-trial")
+        lay.addWidget(self.lb_lic_status)
+
+        self.lb_lic_detail = QLabel("", objectName="desc")
+        self.lb_lic_detail.setWordWrap(True)
+        lay.addWidget(self.lb_lic_detail)
+
+        lay.addSpacing(12)
+
+        # Bouton achat / désactivation
+        self.btn_buy = QPushButton("Acheter Voxaho à vie · 19,99 €", objectName="primary")
+        self.btn_buy.clicked.connect(lambda: webbrowser.open("https://voxaho.com"))
+        lay.addWidget(self.btn_buy, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.btn_deactivate = QPushButton("Désactiver cette machine", objectName="danger")
+        self.btn_deactivate.clicked.connect(self._on_deactivate)
+        lay.addWidget(self.btn_deactivate, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        lay.addSpacing(16)
+        lay.addWidget(self._section_label("Activer une licence"))
+        key_row = QHBoxLayout()
+        self.ed_key = QLineEdit()
+        self.ed_key.setPlaceholderText("XXXX-XXXX-XXXX-XXXX")
+        btn_activate = QPushButton("Activer")
+        btn_activate.clicked.connect(self._on_activate)
+        key_row.addWidget(self.ed_key, 1)
+        key_row.addWidget(btn_activate)
+        lay.addLayout(key_row)
+
+        lay.addStretch(1)
+        self._refresh_license_status()
+        return w
+
+    def _refresh_license_status(self):
+        try:
+            from core import license as lic
+            if lic.is_activated():
+                stored = lic._load() or {}
+                key = stored.get("key", "")
+                masked = "····-····-····-" + key[-4:].upper() if len(key) >= 4 else "····"
+                self.lb_lic_status.setText("Licence active")
+                self.lb_lic_status.setObjectName("license-ok")
+                self.lb_lic_detail.setText(f"Clé : {masked}")
+                self.btn_buy.hide()
+                self.btn_deactivate.show()
+            else:
+                ts = lic.trial_status()
+                if ts.get("active"):
+                    self.lb_lic_status.setText(f"Essai gratuit — {ts['days_left']} jour(s) restant(s)")
+                    self.lb_lic_status.setObjectName("license-trial")
+                    self.lb_lic_detail.setText("Achetez une licence pour continuer après l'expiration.")
+                else:
+                    self.lb_lic_status.setText("Essai expiré")
+                    self.lb_lic_status.setObjectName("license-exp")
+                    self.lb_lic_detail.setText("Entrez une clé pour activer Voxaho.")
+                self.btn_buy.show()
+                self.btn_deactivate.hide()
+            # Réappliquer styles après changement d'objectName
+            self.lb_lic_status.setStyleSheet("")
+            self.lb_lic_status.style().unpolish(self.lb_lic_status)
+            self.lb_lic_status.style().polish(self.lb_lic_status)
+        except Exception as e:
+            logger.warning(f"_refresh_license_status: {e}")
+            self.lb_lic_status.setText("Statut indisponible")
+
+    def _on_activate(self):
+        key = self.ed_key.text().strip()
+        if not key:
+            return
+        try:
+            from core import license as lic
+            lic.activate(key)
+            QMessageBox.information(self, "Licence", "Activation réussie !")
+            self.ed_key.clear()
+            self._refresh_license_status()
+        except Exception as e:
+            QMessageBox.warning(self, "Activation échouée", str(e))
+
+    def _on_deactivate(self):
+        ok = QMessageBox.question(
+            self, "Désactiver",
+            "Désactiver cette machine ? Vous pourrez la réactiver plus tard avec la même clé.",
+        )
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            from core import license as lic
+            lic.deactivate()
+            self._refresh_license_status()
+        except Exception as e:
+            QMessageBox.warning(self, "Erreur", str(e))
+
+    # ── Onglet 6 : À propos ──────────────────────────────────────────────────
+    def _build_about_tab(self) -> QWidget:
+        import os
+        w, lay = self._tab_container("À propos", "")
+
+        # Logo SVG centré en haut
+        icon_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "assets", "voxaho-icon.svg",
+        )
+        if os.path.exists(icon_path):
+            try:
+                from PyQt6.QtSvgWidgets import QSvgWidget
+                logo = QSvgWidget(icon_path)
+                logo.setFixedSize(96, 96)
+                lay.addWidget(logo, alignment=Qt.AlignmentFlag.AlignHCenter)
+                lay.addSpacing(16)
+            except ImportError:
+                # QtSvgWidgets indisponible — on saute silencieusement
+                pass
+
+        title = QLabel("Voxaho", objectName="title")
+        title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(title)
+
+        ver = QLabel(f"Version {APP_VERSION}", objectName="desc")
+        ver.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(ver)
+
+        lay.addSpacing(8)
+        credit = QLabel("Propulsé par Whisper · Conçu par Serge AHOUANSINOU", objectName="desc")
+        credit.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(credit)
+
+        lay.addSpacing(24)
+        links_row = QWidget()
+        links_lay = QHBoxLayout(links_row)
+        links_lay.setContentsMargins(0, 0, 0, 0)
+        links_lay.setSpacing(20)
+        links_lay.addStretch(1)
+        for label, url in [
+            ("voxaho.com",       "https://voxaho.com"),
+            ("Support",          "https://voxaho.com/support"),
+            ("Confidentialité",  "https://voxaho.com/privacy"),
+        ]:
+            link = QLabel(f'<a style="color:#0A84FF; text-decoration:none;" href="{url}">{label}</a>')
+            link.setTextFormat(Qt.TextFormat.RichText)
+            link.setOpenExternalLinks(True)
+            links_lay.addWidget(link)
+        links_lay.addStretch(1)
+        lay.addWidget(links_row)
+
+        lay.addSpacing(24)
+        btn_upd = QPushButton("Vérifier les mises à jour")
+        btn_upd.clicked.connect(lambda: QMessageBox.information(
+            self, "Mises à jour", "Vous êtes à jour."))
+        lay.addWidget(btn_upd, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        lay.addStretch(1)
+        return w
+
+    # ── Chargement valeurs initiales ─────────────────────────────────────────
+    def _load_values(self):
+        cfg = self.config
+
+        # Langue
+        lang = cfg.get("language", "fr")
+        idx = next((i for i, (c, _) in enumerate(LANGS) if c == lang), 0)
+        self.cb_lang.setCurrentIndex(idx)
+
+        # Reformatage
+        self.ck_reformat.setChecked(bool(cfg.get("reformatting", True)))
+
+        # Modèle
+        model = cfg.get("model", "small")
+        idx = next((i for i, (c, _, _) in enumerate(MODELS) if c == model), 1)
+        self.cb_model.setCurrentIndex(idx)
+        self.lb_model_desc.setText(MODELS[idx][2])
+
+        # Touche
+        if not IS_MAC:
+            wk = cfg.get("win_key", "ctrl_r")
+            idx = next((i for i, (c, _) in enumerate(WIN_KEYS) if c == wk), 0)
+            self.cb_winkey.setCurrentIndex(idx)
+
+        # Position
+        pos = cfg.get("bar_position", "custom")
+        for btn in self.bg_pos.buttons():
+            if btn.property("pos_code") == pos:
+                btn.setChecked(True)
+                break
+        else:
+            self.bg_pos.buttons()[2].setChecked(True)
+
+        # Accent
+        accent = cfg.get("accent", "blue")
+        for s in self.swatches:
+            s.setChecked(s.accent_id == accent)
+
+        # Taille mini
+        size = cfg.get("mini_size", "medium")
+        size_idx = {"small": 0, "medium": 1, "large": 2}.get(size, 1)
+        self.sl_size.setValue(size_idx)
+        self.lb_size.setText(["Small", "Medium", "Large"][size_idx])
+
+        # Auto-hide
+        self.ck_autohide.setChecked(bool(cfg.get("auto_hide", True)))
+
+    # ── Récupération valeurs ─────────────────────────────────────────────────
+    def _collect(self) -> dict:
+        cfg = deepcopy(self.config)
+        cfg["language"]     = self.cb_lang.currentData()
+        cfg["reformatting"] = self.ck_reformat.isChecked()
+        cfg["model"]        = self.cb_model.currentData()
+        if not IS_MAC:
+            cfg["win_key"]  = self.cb_winkey.currentData()
+
+        # Position
+        for btn in self.bg_pos.buttons():
+            if btn.isChecked():
+                cfg["bar_position"] = btn.property("pos_code")
+                break
+
+        # Accent
+        for s in self.swatches:
+            if s.isChecked():
+                cfg["accent"] = s.accent_id
+                break
+
+        cfg["mini_size"] = ["small", "medium", "large"][self.sl_size.value()]
+        cfg["auto_hide"] = self.ck_autohide.isChecked()
+        return cfg
+
+    # ── Signaux ──────────────────────────────────────────────────────────────
+    def _emit_preview(self, *_):
+        if self._building:
+            return
+        try:
+            self.settings_preview.emit(self._collect())
+        except Exception as e:
+            logger.warning(f"settings_preview: {e}")
+
+    def _on_apply(self):
+        cfg = self._collect()
+        try:
+            self._save_config(cfg)
+        except Exception as e:
+            QMessageBox.warning(self, "Sauvegarde", f"Impossible de sauver : {e}")
+            return
+        self.config = cfg
+        self._original_config = deepcopy(cfg)
+        self.settings_applied.emit(cfg)
+        self.accept()
+
+    def _on_cancel(self):
+        # Restaurer config initiale en preview
+        try:
+            self.settings_preview.emit(self._original_config)
+        except Exception:
+            pass
+        self.reject()
+
+    def closeEvent(self, event):
+        # Bouton fenêtre = annuler
+        try:
+            self.settings_preview.emit(self._original_config)
+        except Exception:
+            pass
+        super().closeEvent(event)

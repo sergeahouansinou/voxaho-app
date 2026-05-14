@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 240" fill="none">
+  <defs>
+    <radialGradient id="dot-glow-l" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%"   stop-color="#30D158" stop-opacity="0.65"/>
+      <stop offset="55%"  stop-color="#30D158" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#30D158" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="bg-l" cx="0.5" cy="0.35" r="0.7">
+      <stop offset="0%"   stop-color="#1A1A24" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#07070D" stop-opacity="1"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Icon scaled to 200×200 -->
+  <g transform="translate(0,20) scale(0.195)">
+    <rect width="1024" height="1024" rx="230" fill="url(#bg-l)"/>
+    <path d="M 245 240 L 512 745 L 779 240"
+          stroke="#FFFFFF"
+          stroke-width="118"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          fill="none"/>
+    <circle cx="512" cy="385" r="105" fill="url(#dot-glow-l)"/>
+    <circle cx="512" cy="385" r="40"  fill="#30D158"/>
+  </g>
+
+  <!-- Wordmark + tagline -->
+  <text
+    x="240" y="135"
+    font-family="Inter, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif"
+    font-weight="500"
+    font-size="72"
+    fill="#FFFFFF"
+    letter-spacing="16"
+  >VOXAHO</text>
+  <text
+    x="244" y="175"
+    font-family="Inter, -apple-system, sans-serif"
+    font-weight="400"
+    font-size="16"
+    fill="#8E8E93"
+    letter-spacing="6"
+  >DICTÉE VOCALE LOCALE</text>
+</svg>

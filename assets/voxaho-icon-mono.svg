@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="none">
+  <!-- Monochrome — for print, embossing, single-color contexts -->
+  <rect width="1024" height="1024" rx="230" fill="#FFFFFF"/>
+
+  <path d="M 245 240 L 512 745 L 779 240"
+        stroke="#07070D"
+        stroke-width="118"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        fill="none"/>
+
+  <circle cx="512" cy="385" r="40" fill="#07070D"/>
+</svg>

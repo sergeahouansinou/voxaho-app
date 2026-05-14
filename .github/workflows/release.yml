@@ -1,0 +1,156 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  # ── macOS build ────────────────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Homebrew tools
+        run: |
+          brew install create-dmg
+
+      - name: Setup venv & install deps
+        run: |
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install py2app Pillow rubicon-objc
+
+      - name: Pre-download Whisper model
+        run: |
+          source venv/bin/activate
+          python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
+
+      - name: Build DMG
+        run: |
+          source venv/bin/activate
+          ./build_dmg.sh
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: voxaho-macos
+          path: Voxaho-*.dmg
+          retention-days: 30
+
+      - name: Attach DMG to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Voxaho-*.dmg
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+
+  # ── Windows build ──────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: cmd
+        run: |
+          python -m venv venv
+          call venv\Scripts\activate.bat
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Pre-download Whisper model
+        shell: cmd
+        run: |
+          call venv\Scripts\activate.bat
+          python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
+
+      - name: Generate Windows icon (.ico) from SVG via Pillow
+        shell: cmd
+        run: |
+          call venv\Scripts\activate.bat
+          pip install Pillow
+          python -c "from PIL import Image, ImageDraw; sizes=[16,32,48,64,128,256]; imgs=[]; ^
+          import os; ^
+          def render(S): ^
+            img=Image.new('RGBA',(S,S),(0,0,0,0));d=ImageDraw.Draw(img); ^
+            d.rounded_rectangle([0,0,S,S],radius=int(S*0.225),fill=(7,7,13,255)); ^
+            stroke=max(2,int(S*118/1024)); ^
+            x1,y1=int(S*245/1024),int(S*240/1024);x2,y2=int(S*512/1024),int(S*745/1024);x3,y3=int(S*779/1024),int(S*240/1024); ^
+            d.line([(x1,y1),(x2,y2)],fill=(255,255,255,255),width=stroke); ^
+            d.line([(x3,y3),(x2,y2)],fill=(255,255,255,255),width=stroke); ^
+            r=stroke//2; ^
+            [d.ellipse([cx-r,cy-r,cx+r,cy+r],fill=(255,255,255,255)) for cx,cy in [(x1,y1),(x3,y3),(x2,y2)]]; ^
+            dr=int(S*40/1024);cx,cy=int(S*512/1024),int(S*385/1024); ^
+            d.ellipse([cx-dr,cy-dr,cx+dr,cy+dr],fill=(48,209,88,255)); ^
+            return img; ^
+          imgs=[render(s) for s in sizes]; ^
+          os.makedirs('assets',exist_ok=True); ^
+          imgs[0].save('assets/AppIcon.ico',sizes=[(s,s) for s in sizes],append_images=imgs[1:]); ^
+          print('ICO generated')"
+
+      - name: Build EXE with PyInstaller
+        shell: cmd
+        run: |
+          call venv\Scripts\activate.bat
+          pyinstaller ^
+            --name "Voxaho" ^
+            --onefile ^
+            --windowed ^
+            --icon "assets\AppIcon.ico" ^
+            --add-data "assets;assets" ^
+            --hidden-import "faster_whisper" ^
+            --hidden-import "sounddevice" ^
+            --hidden-import "numpy" ^
+            --hidden-import "pynput" ^
+            --hidden-import "pyperclip" ^
+            --hidden-import "pyautogui" ^
+            --hidden-import "PyQt6" ^
+            --collect-all "faster_whisper" ^
+            --collect-all "ctranslate2" ^
+            main.py
+
+      - name: Build Inno Setup installer (if available)
+        shell: cmd
+        continue-on-error: true
+        run: |
+          choco install innosetup -y
+          iscc build_installer.iss
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: voxaho-windows
+          path: |
+            dist/Voxaho.exe
+            Output/*.exe
+            Voxaho-Setup-*.exe
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Attach Windows artifacts to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Voxaho.exe
+            Output/*.exe
+            Voxaho-Setup-*.exe
+          fail_on_unmatched_files: false
+          generate_release_notes: true
