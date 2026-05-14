@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 set APP_NAME=Voxaho
-set VERSION=1.0.3
+set VERSION=1.0.4
 
 echo.
 echo   Build %APP_NAME%-Setup-%VERSION%.exe

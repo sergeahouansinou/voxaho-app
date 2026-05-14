@@ -350,7 +350,16 @@ class FloatingBar(QWidget):
         self._transcription_thread.start()
 
     def _on_permission_error(self):
-        self._state_signal.emit(self.ERROR)
+        # Erreur de permission = persistante (pas de timer auto-recovery 2.5s
+        # comme les autres erreurs), pour laisser l'utilisateur cliquer sur
+        # les boutons "Ouvrir Réglages" / "Redémarrer".
+        self.state = self.ERROR
+        self._target_show = 1.0
+        # Annule un timer précédent si présent
+        if self._error_timer:
+            self._error_timer.stop()
+            self._error_timer = None
+        self.update()
 
     def _on_permission_restored(self):
         """L'Accessibilité vient d'être accordée — sortir de l'état d'erreur."""
@@ -494,7 +503,10 @@ class FloatingBar(QWidget):
             if self._show_frac > 0.3:
                 self._draw_pill(painter, w, bar_h)
             if self._expanded_frac > 0.05 and self._show_frac > 0.7:
-                self._draw_settings_panel(painter, w, bar_h)
+                if self.state == self.ERROR:
+                    self._draw_error_actions(painter, w, bar_h)
+                else:
+                    self._draw_settings_panel(painter, w, bar_h)
 
         painter.end()
 
@@ -644,6 +656,49 @@ class FloatingBar(QWidget):
             msg,
         )
 
+    def _draw_error_actions(self, painter: QPainter, w: int, bar_h: int):
+        """Boutons d'action quand le panneau est ouvert en état ERROR (Mac)."""
+        if not IS_MAC:
+            return
+        a = int(min(1.0, (self._expanded_frac - 0.05) / 0.95) * 220)
+
+        painter.setPen(QPen(QColor(80, 30, 30, a), 0.5))
+        painter.drawLine(20, bar_h + 2, w - 20, bar_h + 2)
+
+        # Cache rects pour le hit-test dans mousePressEvent
+        bw, bh = 150, 32
+        gap = 12
+        total_w = bw * 2 + gap
+        x0 = (w - total_w) // 2
+        y0 = bar_h + 18
+
+        # Bouton "↻ Redémarrer" — primary
+        self._error_btn_restart = QRect(x0, y0, bw, bh)
+        painter.setBrush(QBrush(QColor(10, 132, 255, a)))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(self._error_btn_restart, 8, 8)
+        painter.setPen(QColor(255, 255, 255, a))
+        painter.setFont(QFont("-apple-system", 12, QFont.Weight.Bold))
+        painter.drawText(self._error_btn_restart, Qt.AlignmentFlag.AlignCenter, "↻  Redémarrer")
+
+        # Bouton "Ouvrir Réglages" — ghost
+        self._error_btn_settings = QRect(x0 + bw + gap, y0, bw, bh)
+        painter.setBrush(QBrush(QColor(255, 255, 255, int(0.06 * a))))
+        painter.setPen(QPen(QColor(255, 255, 255, int(0.15 * a)), 1))
+        painter.drawRoundedRect(self._error_btn_settings, 8, 8)
+        painter.setPen(QColor(235, 235, 245, a))
+        painter.setFont(QFont("-apple-system", 12, QFont.Weight.Medium))
+        painter.drawText(self._error_btn_settings, Qt.AlignmentFlag.AlignCenter, "Ouvrir Réglages")
+
+        # Texte d'aide
+        painter.setPen(QColor(150, 150, 155, a))
+        painter.setFont(QFont("-apple-system", 10))
+        painter.drawText(
+            QRect(0, y0 + bh + 12, w, 20),
+            Qt.AlignmentFlag.AlignCenter,
+            "1. Active Voxaho dans Réglages  2. Clique Redémarrer",
+        )
+
     def _draw_settings_panel(self, painter: QPainter, w: int, bar_h: int):
         a = int(min(1.0, (self._expanded_frac - 0.05) / 0.95) * 220)
 
@@ -692,17 +747,31 @@ class FloatingBar(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             if self._expanded_frac > 0.5:
                 bar_h = int(self._mini_h + (BAR_H - self._mini_h) * self._show_frac)
-                # Quitter ×
-                quit_rect = QRect(self.width() - 80, bar_h + 2, 76, 24)
-                if quit_rect.contains(event.pos()):
-                    QApplication.quit()
-                    return
-                # ⚙ Personnaliser…
-                custom_y = bar_h + 16 + 4 * 26 + 10
-                cust_rect = QRect(14, custom_y - 16, 170, 24)
-                if cust_rect.contains(event.pos()):
-                    self._open_settings_window()
-                    return
+
+                # En état ERROR : on a 2 boutons (Redémarrer + Ouvrir Réglages)
+                if self.state == self.ERROR and IS_MAC:
+                    btn_r = getattr(self, "_error_btn_restart", None)
+                    btn_s = getattr(self, "_error_btn_settings", None)
+                    if btn_r and btn_r.contains(event.pos()):
+                        from core.relaunch import relaunch
+                        relaunch()  # ne retourne jamais
+                        return
+                    if btn_s and btn_s.contains(event.pos()):
+                        from core.relaunch import open_accessibility_settings
+                        open_accessibility_settings()
+                        return
+                else:
+                    # Quitter ×
+                    quit_rect = QRect(self.width() - 80, bar_h + 2, 76, 24)
+                    if quit_rect.contains(event.pos()):
+                        QApplication.quit()
+                        return
+                    # ⚙ Personnaliser…
+                    custom_y = bar_h + 16 + 4 * 26 + 10
+                    cust_rect = QRect(14, custom_y - 16, 170, 24)
+                    if cust_rect.contains(event.pos()):
+                        self._open_settings_window()
+                        return
             self._drag_start = event.globalPosition().toPoint() - self.pos()
 
     def mouseMoveEvent(self, event):
