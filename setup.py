@@ -6,7 +6,7 @@ from setuptools import setup
 
 APP     = ['main.py']
 NAME    = 'Voxaho'
-VERSION = '1.0.4'
+VERSION = '1.0.5'
 
 OPTIONS = {
     'argv_emulation': False,        # désactivé : on utilise PyQt6

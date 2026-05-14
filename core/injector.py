@@ -38,14 +38,34 @@ def _inject_mac(text: str) -> None:
 
 
 def _clipboard_mac(text: str) -> None:
-    proc = subprocess.run(
-        ["pbcopy"],
-        input=text.encode("utf-8"),
-        capture_output=True,
-        timeout=3,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"pbcopy: {proc.stderr.decode()}")
+    """Copie dans le presse-papiers macOS via NSPasteboard (API native, zéro encodage).
+
+    pbcopy en fallback si AppKit indisponible. Sans LANG=UTF-8 dans l'env du
+    process py2app, pbcopy peut convertir les bytes UTF-8 en Mac Roman →
+    mojibake ("é" devient "√©"). NSPasteboard évite complètement ce piège.
+    """
+    try:
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        ok = pb.setString_forType_(text, NSPasteboardTypeString)
+        if not ok:
+            raise RuntimeError("NSPasteboard.setString_forType_ retourné False")
+    except ImportError:
+        # Fallback : pbcopy avec LANG forcé en UTF-8 pour éviter le mojibake
+        import os
+        env = os.environ.copy()
+        env["LANG"] = env.get("LANG") or "en_US.UTF-8"
+        env["LC_ALL"] = env.get("LC_ALL") or "en_US.UTF-8"
+        proc = subprocess.run(
+            ["pbcopy"],
+            input=text.encode("utf-8"),
+            capture_output=True,
+            timeout=3,
+            env=env,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"pbcopy: {proc.stderr.decode(errors='replace')}")
 
 
 def _paste_mac() -> None:

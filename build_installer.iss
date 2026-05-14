@@ -1,5 +1,5 @@
 #define MyAppName "Voxaho"
-#define MyAppVersion "1.0.4"
+#define MyAppVersion "1.0.5"
 #define MyAppPublisher "Serge AHOUANSINOU"
 #define MyAppURL "https://voxaho.com"
 #define MyAppExeName "Voxaho.exe"
