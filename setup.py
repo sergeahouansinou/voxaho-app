@@ -6,7 +6,7 @@ from setuptools import setup
 
 APP     = ['main.py']
 NAME    = 'Voxaho'
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 
 OPTIONS = {
     'argv_emulation': False,        # désactivé : on utilise PyQt6
@@ -26,7 +26,7 @@ OPTIONS = {
         'NSHighResolutionCapable': True,
     },
     'packages': [
-        'faster_whisper', 'sounddevice', 'numpy',
+        'faster_whisper', 'sounddevice', '_sounddevice_data', 'numpy',
         'PyQt6', 'Quartz', 'AppKit', 'CoreFoundation', 'ApplicationServices',
         'pyautogui',
     ],
