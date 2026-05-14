@@ -6,7 +6,7 @@ from setuptools import setup
 
 APP     = ['main.py']
 NAME    = 'Voxaho'
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 
 OPTIONS = {
     'argv_emulation': False,        # désactivé : on utilise PyQt6
@@ -27,7 +27,7 @@ OPTIONS = {
     },
     'packages': [
         'faster_whisper', 'sounddevice', 'numpy',
-        'PyQt6', 'Quartz', 'AppKit', 'CoreFoundation',
+        'PyQt6', 'Quartz', 'AppKit', 'CoreFoundation', 'ApplicationServices',
         'pyautogui',
     ],
     # rubicon est un namespace package que py2app ne sait pas bootstrapper.

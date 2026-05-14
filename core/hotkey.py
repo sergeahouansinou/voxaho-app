@@ -86,6 +86,10 @@ class HotkeyListener(QObject):
         on retente toutes les 3 s. Dès que la permission est accordée, on rentre
         dans la run loop et on émet `permission_restored` pour que l'UI sorte
         de l'état d'erreur.
+
+        Double vérification :
+          1. AXIsProcessTrusted() — API officielle Apple, source de vérité
+          2. CGEventTapCreate() — création effective du tap
         """
         import time
 
@@ -101,6 +105,27 @@ class HotkeyListener(QObject):
             logger.error(f"Quartz indisponible : {e}")
             self.permission_error.emit()
             return
+
+        # AXIsProcessTrusted : vérité officielle macOS sur la permission Accessibilité
+        # AXIsProcessTrustedWithOptions(prompt=True) : force le popup système de demande
+        try:
+            from ApplicationServices import (
+                AXIsProcessTrusted,
+                AXIsProcessTrustedWithOptions,
+                kAXTrustedCheckOptionPrompt,
+            )
+            _ax_check = AXIsProcessTrusted
+            _ax_prompt_options = {kAXTrustedCheckOptionPrompt: True}
+            _ax_prompt = lambda: AXIsProcessTrustedWithOptions(_ax_prompt_options)
+        except ImportError:
+            _ax_check = None
+            _ax_prompt = None
+            logger.warning("ApplicationServices indisponible — fallback sur CGEventTapCreate")
+
+        # Au tout premier appel : force le prompt système pour que macOS affiche
+        # le dialog "Voxaho voudrait contrôler cet ordinateur via Accessibilité"
+        # qui propose un bouton "Ouvrir les Réglages Système".
+        _first_prompt_done = False
 
         def _callback(proxy, event_type, event, refcon):
             if self._should_stop:
@@ -123,6 +148,32 @@ class HotkeyListener(QObject):
         error_emitted = False
 
         while not self._should_stop:
+            # 1. Vérif officielle Apple : sommes-nous trusted pour Accessibilité ?
+            if _ax_check is not None and not _ax_check():
+                if not error_emitted:
+                    logger.warning(
+                        "AXIsProcessTrusted = False → Accessibilité non accordée. "
+                        "Réglages Système > Confidentialité > Accessibilité : activez Voxaho. "
+                        "Voxaho retentera automatiquement toutes les 3 s."
+                    )
+                    self.permission_error.emit()
+                    error_emitted = True
+                    # Force le popup macOS la première fois — déclenche
+                    # le dialog système avec bouton "Ouvrir les Réglages"
+                    if _ax_prompt is not None and not _first_prompt_done:
+                        try:
+                            _ax_prompt()
+                            _first_prompt_done = True
+                            logger.info("Popup macOS Accessibilité demandé")
+                        except Exception as e:
+                            logger.warning(f"_ax_prompt: {e}")
+                for _ in range(30):
+                    if self._should_stop:
+                        return
+                    time.sleep(0.1)
+                continue
+
+            # 2. Tentative de création du tap CGEventTap
             try:
                 tap = CGEventTapCreate(
                     kCGHIDEventTap, kCGHeadInsertEventTap,
@@ -135,13 +186,11 @@ class HotkeyListener(QObject):
             if tap is None:
                 if not error_emitted:
                     logger.warning(
-                        "CGEventTap refusé — Accessibilité non accordée. "
-                        "Réglages Système > Confidentialité > Accessibilité : activez Voxaho. "
-                        "Voxaho retentera automatiquement toutes les 3 s."
+                        "CGEventTapCreate=None malgré AX trusted — état macOS inattendu. "
+                        "Retry dans 3 s."
                     )
                     self.permission_error.emit()
                     error_emitted = True
-                # Attendre 3 s en restant réactif au stop()
                 for _ in range(30):
                     if self._should_stop:
                         return

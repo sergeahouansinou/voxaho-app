@@ -2,7 +2,7 @@
 set -e
 
 APP_NAME="Voxaho"
-VERSION="1.0.1"
+VERSION="1.0.2"
 DMG_NAME="${APP_NAME}-${VERSION}.dmg"
 BUILD_DIR="dist"
 APP_PATH="${BUILD_DIR}/${APP_NAME}.app"
