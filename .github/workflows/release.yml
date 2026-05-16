@@ -105,24 +105,7 @@ jobs:
         run: |
           call venv\Scripts\activate.bat
           pip install Pillow
-          python -c "from PIL import Image, ImageDraw; sizes=[16,32,48,64,128,256]; imgs=[]; ^
-          import os; ^
-          def render(S): ^
-            img=Image.new('RGBA',(S,S),(0,0,0,0));d=ImageDraw.Draw(img); ^
-            d.rounded_rectangle([0,0,S,S],radius=int(S*0.225),fill=(7,7,13,255)); ^
-            stroke=max(2,int(S*118/1024)); ^
-            x1,y1=int(S*245/1024),int(S*240/1024);x2,y2=int(S*512/1024),int(S*745/1024);x3,y3=int(S*779/1024),int(S*240/1024); ^
-            d.line([(x1,y1),(x2,y2)],fill=(255,255,255,255),width=stroke); ^
-            d.line([(x3,y3),(x2,y2)],fill=(255,255,255,255),width=stroke); ^
-            r=stroke//2; ^
-            [d.ellipse([cx-r,cy-r,cx+r,cy+r],fill=(255,255,255,255)) for cx,cy in [(x1,y1),(x3,y3),(x2,y2)]]; ^
-            dr=int(S*40/1024);cx,cy=int(S*512/1024),int(S*385/1024); ^
-            d.ellipse([cx-dr,cy-dr,cx+dr,cy+dr],fill=(48,209,88,255)); ^
-            return img; ^
-          imgs=[render(s) for s in sizes]; ^
-          os.makedirs('assets',exist_ok=True); ^
-          imgs[0].save('assets/AppIcon.ico',sizes=[(s,s) for s in sizes],append_images=imgs[1:]); ^
-          print('ICO generated')"
+          python scripts\gen_windows_icon.py
 
       - name: Build EXE with PyInstaller
         shell: cmd
