@@ -51,17 +51,28 @@ jobs:
           path: Voxaho-*.dmg
           retention-days: 30
 
-      - name: Attach DMG to PUBLIC release repo (voxaho-releases)
+      - name: Upload DMG to VPS via SCP
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: appleboy/scp-action@v0.1.7
         with:
-          repository: sergeahouansinou/voxaho-releases
-          token: ${{ secrets.RELEASES_PAT }}
-          tag_name: ${{ github.ref_name }}
-          name: Voxaho ${{ github.ref_name }}
-          files: Voxaho-*.dmg
-          fail_on_unmatched_files: false
-          generate_release_notes: true
+          host:     ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
+          source:   "Voxaho-*.dmg"
+          target:   "/var/www/voxaho-downloads/"
+          overwrite: true
+          strip_components: 0
+
+      - name: Update 'latest' symlinks on VPS
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /var/www/voxaho-downloads
+            ln -sfn Voxaho-${GITHUB_REF_NAME#v}.dmg Voxaho-latest.dmg
 
   # ── Windows build ──────────────────────────────────────────────────────────
   build-windows:
@@ -152,17 +163,36 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Attach Windows artifacts to PUBLIC release repo (voxaho-releases)
+      - name: Collect Windows artifacts for upload
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        shell: cmd
+        run: |
+          mkdir win-out
+          if exist dist\Voxaho.exe copy dist\Voxaho.exe win-out\
+          if exist Output\*.exe copy Output\*.exe win-out\
+          dir win-out
+
+      - name: Upload Windows artifacts to VPS via SCP
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: appleboy/scp-action@v0.1.7
         with:
-          repository: sergeahouansinou/voxaho-releases
-          token: ${{ secrets.RELEASES_PAT }}
-          tag_name: ${{ github.ref_name }}
-          name: Voxaho ${{ github.ref_name }}
-          files: |
-            dist/Voxaho.exe
-            Output/*.exe
-            Voxaho-Setup-*.exe
-          fail_on_unmatched_files: false
-          generate_release_notes: true
+          host:     ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
+          source:   "win-out/*"
+          target:   "/var/www/voxaho-downloads/"
+          overwrite: true
+          strip_components: 1
+
+      - name: Update Windows 'latest' symlinks on VPS
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /var/www/voxaho-downloads
+            if [ -f "Voxaho-Setup-${GITHUB_REF_NAME#v}.exe" ]; then
+              ln -sfn "Voxaho-Setup-${GITHUB_REF_NAME#v}.exe" Voxaho-Setup-latest.exe
+            fi
