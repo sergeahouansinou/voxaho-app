@@ -6,7 +6,6 @@ on:
       - 'v*'
   workflow_dispatch:
 
-# Donne au GITHUB_TOKEN l'autorisation de créer/modifier les releases
 permissions:
   contents: write
 
@@ -23,8 +22,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install Homebrew tools
-        run: |
-          brew install create-dmg
+        run: brew install create-dmg
 
       - name: Setup venv & install deps
         run: |
@@ -51,28 +49,36 @@ jobs:
           path: Voxaho-*.dmg
           retention-days: 30
 
-      - name: Upload DMG to VPS via SCP
+      # ── SCP upload (bash natif, marche sur macOS runner) ────────────────────
+      - name: Configure SSH key
         if: startsWith(github.ref, 'refs/tags/')
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host:     ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          source:   "Voxaho-*.dmg"
-          target:   "/var/www/voxaho-downloads/"
-          overwrite: true
-          strip_components: 0
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Update 'latest' symlinks on VPS
+      - name: Upload DMG to VPS
         if: startsWith(github.ref, 'refs/tags/')
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host:     ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            cd /var/www/voxaho-downloads
-            ln -sfn Voxaho-${GITHUB_REF_NAME#v}.dmg Voxaho-latest.dmg
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          scp -i ~/.ssh/deploy_key Voxaho-*.dmg \
+            "${VPS_USER}@${VPS_HOST}:/var/www/voxaho-downloads/"
+
+      - name: Update 'latest' symlink for DMG
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ssh -i ~/.ssh/deploy_key "${VPS_USER}@${VPS_HOST}" \
+            "cd /var/www/voxaho-downloads && ln -sfn Voxaho-${VERSION}.dmg Voxaho-latest.dmg"
 
   # ── Windows build ──────────────────────────────────────────────────────────
   build-windows:
@@ -100,7 +106,7 @@ jobs:
           call venv\Scripts\activate.bat
           python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
 
-      - name: Generate Windows icon (.ico) from SVG via Pillow
+      - name: Generate Windows icon (.ico)
         shell: cmd
         run: |
           call venv\Scripts\activate.bat
@@ -135,47 +141,73 @@ jobs:
           choco install innosetup -y
           iscc build_installer.iss
 
-      - name: Upload Windows artifact
+      - name: Rename versioned EXE
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="dev"
+          fi
+          mkdir -p win-out
+          [ -f dist/Voxaho.exe ] && cp "dist/Voxaho.exe" "win-out/Voxaho-${VERSION}.exe" || true
+          # Setup-version exe est déjà nommé correctement par Inno Setup s'il a marché
+          if compgen -G "Output/*.exe" > /dev/null; then
+            cp Output/*.exe win-out/
+          fi
+          if compgen -G "Voxaho-Setup-*.exe" > /dev/null; then
+            cp Voxaho-Setup-*.exe win-out/
+          fi
+          echo "=== win-out/ ==="
+          ls -la win-out/ || echo "(vide)"
+
+      - name: Upload Windows artifact (GitHub)
         uses: actions/upload-artifact@v4
         with:
           name: voxaho-windows
-          path: |
-            dist/Voxaho.exe
-            Output/*.exe
-            Voxaho-Setup-*.exe
+          path: win-out/*
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Collect Windows artifacts for upload
+      # ── SCP upload (bash natif via Git Bash sur Windows runner) ─────────────
+      - name: Configure SSH key
         if: startsWith(github.ref, 'refs/tags/')
-        shell: cmd
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
         run: |
-          mkdir win-out
-          if exist dist\Voxaho.exe copy dist\Voxaho.exe win-out\
-          if exist Output\*.exe copy Output\*.exe win-out\
-          dir win-out
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Upload Windows artifacts to VPS via SCP
+      - name: Upload Windows artifacts to VPS
         if: startsWith(github.ref, 'refs/tags/')
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host:     ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          source:   "win-out/*"
-          target:   "/var/www/voxaho-downloads/"
-          overwrite: true
-          strip_components: 1
+        shell: bash
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          if [ -z "$(ls -A win-out/ 2>/dev/null)" ]; then
+            echo "win-out/ vide, rien à uploader"
+            exit 0
+          fi
+          scp -i ~/.ssh/deploy_key win-out/* \
+            "${VPS_USER}@${VPS_HOST}:/var/www/voxaho-downloads/"
 
-      - name: Update Windows 'latest' symlinks on VPS
+      - name: Update 'latest' symlinks for Windows
         if: startsWith(github.ref, 'refs/tags/')
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host:     ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          script: |
+        shell: bash
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ssh -i ~/.ssh/deploy_key "${VPS_USER}@${VPS_HOST}" bash <<EOF
             cd /var/www/voxaho-downloads
-            if [ -f "Voxaho-Setup-${GITHUB_REF_NAME#v}.exe" ]; then
-              ln -sfn "Voxaho-Setup-${GITHUB_REF_NAME#v}.exe" Voxaho-Setup-latest.exe
-            fi
+            # EXE one-file
+            [ -f "Voxaho-${VERSION}.exe" ] && ln -sfn "Voxaho-${VERSION}.exe" Voxaho-latest.exe
+            # Setup installer (Inno) — optionnel
+            [ -f "Voxaho-Setup-${VERSION}.exe" ] && ln -sfn "Voxaho-Setup-${VERSION}.exe" Voxaho-Setup-latest.exe
+            ls -la
+          EOF
