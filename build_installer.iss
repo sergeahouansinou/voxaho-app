@@ -27,6 +27,7 @@ Name: "french"; MessagesFile: "compiler:Languages\French.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
+Name: "desktopicon"; Description: "Créer un raccourci sur le Bureau"; GroupDescription: "Options :"
 Name: "startup"; Description: "Lancer Voxaho au démarrage de Windows"; GroupDescription: "Options :"; Flags: unchecked
 
 [Files]
