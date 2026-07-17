@@ -127,6 +127,22 @@ ACCENT_PALETTES = {
 }
 
 
+def open_workspace_link_geom(bar_h: int) -> tuple[int, int, int, int]:
+    """Rectangle (x, y, w, h) du lien « Ouvrir Voxaho » du panneau étendu (Phase 1).
+
+    Fonction pure (testable sans Qt) — garde le DESSIN (_draw_settings_panel) et
+    le HIT-TEST (mousePressEvent) parfaitement cohérents. Le lien est calé sur la
+    même ligne que « ⚙ Personnaliser… » (custom_y), placé à droite pour ne pas
+    empiéter sur son rectangle cliquable (14 → 183) ni déborder de la barre.
+
+    NB : la formule custom_y est identique à celle du dessin/hit-test de
+    « Personnaliser… » (bar_h + 16 + 4 lignes de 26 px + 10) → toute retouche de
+    l'une doit suivre l'autre.
+    """
+    custom_y = bar_h + 16 + 4 * 26 + 10
+    return (184, custom_y - 16, 152, 24)
+
+
 class FloatingBar(QWidget):
 
     _transcription_signal = pyqtSignal(str)
@@ -172,6 +188,9 @@ class FloatingBar(QWidget):
 
         # Fenêtre settings (référence GC)
         self._settings_win = None
+
+        # Fenêtre Workspace / fenêtre principale (référence GC, Phase 1)
+        self._workspace_win = None
 
         # Ancrage géométrique
         self._anchor_cx = 0
@@ -299,12 +318,79 @@ class FloatingBar(QWidget):
             logger.warning(f"_force_always_on_top: {e}")
 
     def _setup_transcriber(self):
+        self._transcriber = self._build_transcriber()
+        # Préchargement au démarrage (LE gain majeur du ressenti) : charge +
+        # warmup le modèle dans un thread daemon pour que la 1ʳᵉ dictée n'attende
+        # plus 2-5 s. preload() est thread-safe / idempotent / ne lève jamais.
+        self._launch_preload()
+
+    def _build_transcriber(self):
+        """Instancie un Transcriber avec la config courante (beam_size + backend).
+
+        Défensif : si le constructeur de l'agent moteur ne connaît pas encore les
+        kwargs `beam_size`/`backend` (ordre d'arrivée des agents parallèles), on
+        retombe sur la signature minimale. Transitoire — à retirer une fois le
+        contrat moteur stabilisé.
+        """
         from core.transcriber import Transcriber
-        self._transcriber = Transcriber(
-            model        = self.config.get("model",        "small"),
-            language     = self.config.get("language",     "fr"),
-            reformatting = self.config.get("reformatting", True),
-        )
+        model        = self.config.get("model",           "small")
+        language     = self.config.get("language",        "fr")
+        reformatting = self.config.get("reformatting",    True)
+        beam_size    = self.config.get("beam_size",       1)
+        backend      = self.config.get("compute_backend", "auto")
+        try:
+            return Transcriber(
+                model        = model,
+                language     = language,
+                reformatting = reformatting,
+                beam_size    = beam_size,
+                backend      = backend,
+            )
+        except TypeError:
+            # Transitoire : constructeur moteur pas encore à jour → sans kwargs.
+            logger.warning("Transcriber sans kwargs beam_size/backend (contrat moteur transitoire)")
+            return Transcriber(
+                model        = model,
+                language     = language,
+                reformatting = reformatting,
+            )
+
+    def _launch_preload(self):
+        """Lance preload() du transcriber dans un thread daemon (défensif)."""
+        preload = getattr(self._transcriber, "preload", None)
+        if not callable(preload):
+            return  # contrat moteur transitoire : preload() pas encore dispo
+        threading.Thread(target=preload, daemon=True, name="voxaho-preload").start()
+
+    def _apply_beam_size(self, beam_size: int):
+        """Applique le beam_size à chaud : via update_settings si dispo, sinon setattr."""
+        update = getattr(self._transcriber, "update_settings", None)
+        if callable(update):
+            try:
+                update(beam_size=beam_size)
+                return
+            except TypeError:
+                pass  # transitoire : update_settings sans kwarg beam_size
+        # Repli : attribut direct (le moteur expose self.beam_size)
+        try:
+            self._transcriber.beam_size = beam_size
+        except Exception as e:
+            logger.warning(f"_apply_beam_size: {e}")
+
+    def _recreate_transcriber(self):
+        """Recrée le Transcriber (backend changé) : unload → new → preload.
+
+        Le backend de calcul est fixé au constructeur ; le changer impose une
+        reconstruction complète plutôt qu'un simple réglage à chaud.
+        """
+        old = self._transcriber
+        if old is not None:
+            try:
+                old.unload_model()
+            except Exception as e:
+                logger.warning(f"_recreate_transcriber — unload ancien: {e}")
+        self._transcriber = self._build_transcriber()
+        self._launch_preload()
 
     def _setup_hotkey(self):
         self._start_hotkey(self.config.get("win_key", "ctrl_r"))
@@ -383,7 +469,12 @@ class FloatingBar(QWidget):
 
         try:
             from core.recorder import Recorder
-            self._recorder = Recorder()
+            device = self.config.get("input_device")
+            try:
+                self._recorder = Recorder(device=device)
+            except TypeError:
+                # Transitoire : Recorder pas encore doté du kwarg `device`.
+                self._recorder = Recorder()
             self._recorder.start()
         except Exception as e:
             logger.error(f"Recorder start: {e}")
@@ -465,9 +556,44 @@ class FloatingBar(QWidget):
                 logger.error(f"Injection: {e}", exc_info=True)
                 self._state_signal.emit(self.ERROR)
             else:
+                # Injection réussie : enregistrer la dictée dans l'historique
+                # (best-effort) PUIS repasser à IDLE. Fait ici — thread
+                # d'injection, après l'inject — pour ne rien ajouter au chemin
+                # critique de la dictée (Phase 1).
+                self._record_dictation(text)
                 self._state_signal.emit(self.IDLE)
 
         threading.Thread(target=_run, daemon=True, name="Injection").start()
+
+    def _record_dictation(self, text: str):
+        """Enregistre la dictée dans l'historique local puis rafraîchit le Workspace.
+
+        Contrat couche données fourni par un agent parallèle (core.history) : tout
+        est encapsulé DÉFENSIVEMENT — un échec d'historique ne doit JAMAIS casser
+        la dictée ni l'UI. add_entry gère déjà le flag d'activation (is_enabled),
+        un simple appel suffit.
+
+        Appelé depuis le thread d'injection : l'émission d'un signal Qt reste
+        thread-safe (connexion queued automatique vers le thread GUI).
+        """
+        try:
+            from core import history
+            history.add_entry(
+                text,
+                language   = self.config.get("language"),
+                model      = self.config.get("model"),
+                word_count = len(text.split()),
+            )
+        except Exception as e:
+            logger.warning(f"Historique add_entry: {e}")
+
+        # Rafraîchissement live du Workspace s'il est ouvert (§4)
+        win = getattr(self, "_workspace_win", None)
+        if win is not None:
+            try:
+                win.dictation_added.emit()
+            except Exception as e:
+                logger.warning(f"Workspace refresh (dictation_added): {e}")
 
     def _set_state(self, state: str):
         prev_state = self.state
@@ -819,6 +945,14 @@ class FloatingBar(QWidget):
         painter.setFont(QFont("-apple-system", 11, QFont.Weight.Medium))
         painter.drawText(20, custom_y, "⚙  Personnaliser…")
 
+        # Lien "Ouvrir Voxaho" (même accent, à droite sur la même ligne) — ouvre
+        # la fenêtre principale Workspace (Phase 1). Géométrie via fonction pure
+        # partagée avec le hit-test de mousePressEvent.
+        gx, gy, _gw, _gh = open_workspace_link_geom(bar_h)
+        painter.setPen(QColor(ap.red(), ap.green(), ap.blue(), a))
+        painter.setFont(QFont("-apple-system", 11, QFont.Weight.Medium))
+        painter.drawText(gx + 6, gy + 16, "🏠  Ouvrir Voxaho")
+
         painter.setPen(QColor(255, 69, 58, a))
         painter.setFont(f_val)
         painter.drawText(w - 66, y0, "Quitter ×")
@@ -859,6 +993,11 @@ class FloatingBar(QWidget):
                     if quit_rect.contains(event.pos()):
                         QApplication.quit()
                         return
+                    # 🏠 Ouvrir Voxaho (lien Workspace, à droite de la ligne)
+                    open_rect = QRect(*open_workspace_link_geom(bar_h))
+                    if open_rect.contains(event.pos()):
+                        self._open_workspace()
+                        return
                     # ⚙ Personnaliser…
                     custom_y = bar_h + 16 + 4 * 26 + 10
                     cust_rect = QRect(14, custom_y - 16, 170, 24)
@@ -889,10 +1028,26 @@ class FloatingBar(QWidget):
 
     def apply_config(self, new_config: dict):
         old_win_key = self.config.get("win_key", "ctrl_r")
+        old_backend = self.config.get("compute_backend", "auto")
         self.config = new_config
-        self._transcriber.language     = None if new_config.get("language") == "auto" else new_config.get("language", "fr")
-        self._transcriber.reformatting = new_config.get("reformatting", True)
-        self._transcriber.update_model(new_config.get("model", "small"))
+
+        new_backend = new_config.get("compute_backend", "auto")
+        if new_backend != old_backend:
+            # Le backend est fixé au constructeur du Transcriber : un simple
+            # setattr ne suffit pas, il faut le recréer intégralement (unload de
+            # l'ancien modèle, nouveau Transcriber avec la config courante, puis
+            # relance du préchargement en thread daemon).
+            self._recreate_transcriber()
+        else:
+            # Hot-swap standard : langue + reformatage + modèle (existant),
+            # plus le beam_size (nouveau).
+            self._transcriber.language     = None if new_config.get("language") == "auto" else new_config.get("language", "fr")
+            self._transcriber.reformatting = new_config.get("reformatting", True)
+            self._transcriber.update_model(new_config.get("model", "small"))
+            self._apply_beam_size(new_config.get("beam_size", 1))
+
+        # NB : input_device n'exige aucune action ici — il est stocké dans
+        # self.config et lu au prochain enregistrement (_on_fn_press).
 
         # Touche de dictée Windows à chaud (M1) — la touche macOS (Fn) est
         # fixe, pas de reconfiguration nécessaire sur Mac
@@ -961,3 +1116,57 @@ class FloatingBar(QWidget):
 
     def _on_settings_closed(self, _result):
         self._settings_win = None
+
+    # ── Fenêtre Workspace (fenêtre principale) ──────────────────────────────────
+
+    def _open_workspace(self):
+        """Ouvre (ou ré-active) la fenêtre principale Workspace (Phase 1).
+
+        Import différé + défensif : WorkspaceWindow est fourni par un agent
+        parallèle ; son indisponibilité ne doit pas casser la barre. Une seule
+        instance est gardée (self._workspace_win) : si déjà ouverte, on la ramène
+        au premier plan plutôt que d'en rouvrir une.
+        """
+        try:
+            from ui.workspace_window import WorkspaceWindow
+        except Exception as e:
+            logger.warning(f"WorkspaceWindow import: {e}")
+            return
+
+        # Déjà ouverte → premier plan
+        if self._workspace_win is not None:
+            try:
+                self._workspace_win.raise_()
+                self._workspace_win.activateWindow()
+                return
+            except Exception:
+                self._workspace_win = None
+
+        try:
+            self._workspace_win = WorkspaceWindow(
+                self.config,
+                self._save_config,
+                open_settings_fn=self._open_settings_window,
+            )
+        except Exception as e:
+            logger.warning(f"WorkspaceWindow init: {e}")
+            self._workspace_win = None
+            return
+
+        # QMainWindow n'a pas de signal `finished` (contrairement à QDialog) : on
+        # remet la référence à None via `destroyed` pour permettre une réouverture
+        # propre après fermeture.
+        try:
+            self._workspace_win.destroyed.connect(self._on_workspace_closed)
+        except Exception as e:
+            logger.warning(f"WorkspaceWindow destroyed connect: {e}")
+
+        self._workspace_win.show()
+        try:
+            self._workspace_win.raise_()
+            self._workspace_win.activateWindow()
+        except Exception:
+            pass
+
+    def _on_workspace_closed(self, *_args):
+        self._workspace_win = None

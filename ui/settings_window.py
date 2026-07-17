@@ -52,12 +52,20 @@ LANGS = [
     ("auto", "🌍  Auto"),
 ]
 
+# Liste des modèles Whisper (code, libellé combo, description perf).
+# large-v3-turbo est le meilleur compromis mis en avant (« ✓ Recommandé ») ;
+# small reste le défaut léger (rapide, empreinte disque minimale).
 MODELS = [
-    ("tiny",     "Tiny",                 "≈ 0,3 s · 200 Mo · qualité basique"),
-    ("small",    "Small (recommandé)",   "≈ 0,8 s · 500 Mo · bon compromis"),
-    ("medium",   "Medium",               "≈ 1,5 s · 1,5 Go · meilleure qualité"),
-    ("large-v3", "Large v3",             "≈ 3 s · 3 Go · qualité maximale"),
+    ("tiny",           "Tiny",                        "≈ 0,3 s · 200 Mo · qualité basique"),
+    ("small",          "Small (léger)",               "≈ 0,8 s · 500 Mo · bon compromis léger"),
+    ("medium",         "Medium",                      "≈ 1,5 s · 1,5 Go · meilleure qualité"),
+    ("large-v3-turbo", "Large v3 Turbo (recommandé)", "≈ 1 s · 1,6 Go · qualité quasi-max, très rapide ✓ Recommandé"),
+    ("large-v3",       "Large v3",                    "≈ 3 s · 3 Go · qualité maximale"),
 ]
+
+# Presets vitesse/qualité mappés sur beam_size (faster-whisper).
+# « Vitesse » = réactivité maximale ; « Qualité » = plus d'hypothèses explorées.
+BEAM_PRESETS = {"speed": 1, "quality": 5}
 
 WIN_KEYS = [
     ("ctrl_r",    "Ctrl droit"),
@@ -263,7 +271,7 @@ class SettingsWindow(QDialog):
 
         self.nav = QListWidget(objectName="nav")
         self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        for label in ["⚙   Général", "🧠  Modèle", "⌨   Touche",
+        for label in ["⚙   Général", "🧠  Modèle", "🎙  Micro", "⌨   Touche",
                       "🎨  Apparence", "🔑  Licence", "ℹ   À propos"]:
             it = QListWidgetItem(label)
             it.setSizeHint(QSize(0, 40))
@@ -280,6 +288,7 @@ class SettingsWindow(QDialog):
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_general_tab())
         self.stack.addWidget(self._build_model_tab())
+        self.stack.addWidget(self._build_mic_tab())
         self.stack.addWidget(self._build_hotkey_tab())
         self.stack.addWidget(self._build_appearance_tab())
         self.stack.addWidget(self._build_license_tab())
@@ -379,6 +388,27 @@ class SettingsWindow(QDialog):
         self.lb_model_desc.setWordWrap(True)
         lay.addWidget(self.lb_model_desc)
 
+        # ── Vitesse vs Qualité (mappe sur beam_size) ──────────────────────
+        lay.addSpacing(16)
+        lay.addWidget(self._section_label("Vitesse / Qualité"))
+        self.bg_beam = QButtonGroup(self)
+        self.rb_speed = QRadioButton("  Vitesse — réactivité maximale")
+        self.rb_speed.setProperty("beam_preset", "speed")
+        self.rb_quality = QRadioButton("  Qualité — un peu plus lent, plus précis")
+        self.rb_quality.setProperty("beam_preset", "quality")
+        self.bg_beam.addButton(self.rb_speed)
+        self.bg_beam.addButton(self.rb_quality)
+        self.rb_speed.toggled.connect(self._emit_preview)
+        lay.addWidget(self.rb_speed)
+        lay.addWidget(self.rb_quality)
+        beam_hint = QLabel(
+            f"« Vitesse » explore une seule hypothèse (beam {BEAM_PRESETS['speed']}) ; "
+            f"« Qualité » en explore plusieurs (beam {BEAM_PRESETS['quality']}).",
+            objectName="hint",
+        )
+        beam_hint.setWordWrap(True)
+        lay.addWidget(beam_hint)
+
         lay.addSpacing(16)
         redl = QPushButton("Re-télécharger le modèle")
         redl.clicked.connect(self._on_redownload)
@@ -399,6 +429,84 @@ class SettingsWindow(QDialog):
             "Pour re-télécharger le modèle, supprimez le dossier ~/.cache/huggingface\n"
             "puis relancez Voxaho.",
         )
+
+    # ── Onglet Micro ─────────────────────────────────────────────────────────
+    def _build_mic_tab(self) -> QWidget:
+        w, lay = self._tab_container("Micro", "Choisir le périphérique d'entrée")
+
+        lay.addWidget(self._section_label("Microphone"))
+        self.cb_mic = QComboBox()
+        self.cb_mic.currentIndexChanged.connect(self._emit_preview)
+        lay.addWidget(self.cb_mic)
+
+        self.lb_mic_hint = QLabel("", objectName="hint")
+        self.lb_mic_hint.setWordWrap(True)
+        lay.addWidget(self.lb_mic_hint)
+
+        lay.addSpacing(12)
+        self.btn_mic_refresh = QPushButton("Rafraîchir la liste")
+        self.btn_mic_refresh.clicked.connect(self._refresh_mic_list)
+        lay.addWidget(self.btn_mic_refresh, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        lay.addStretch(1)
+        # Peuplement initial (défensif : le helper moteur peut être indisponible).
+        self._refresh_mic_list()
+        return w
+
+    def _refresh_mic_list(self):
+        """(Re)construit la liste des micros via core.recorder.list_input_devices.
+
+        Toujours une 1ʳᵉ entrée « Micro système par défaut » (valeur None), puis
+        chaque périphérique (index stocké en currentData). Défensif : si le helper
+        est indisponible (agent moteur pas encore prêt) ou renvoie une liste vide,
+        on n'affiche que l'entrée par défaut et on désactive le combo.
+        """
+        # Préserve la sélection courante (index périphérique ou None).
+        if self.cb_mic.count():
+            current = self.cb_mic.currentData()
+        else:
+            current = self.config.get("input_device")
+
+        self.cb_mic.blockSignals(True)
+        self.cb_mic.clear()
+        self.cb_mic.addItem("Micro système par défaut", None)
+
+        devices = []
+        try:
+            from core.recorder import list_input_devices
+            devices = list_input_devices() or []
+        except Exception as e:  # ImportError, erreur PortAudio, etc.
+            logger.debug(f"list_input_devices indisponible : {e}")
+            devices = []
+
+        if devices:
+            self.cb_mic.setEnabled(True)
+            for dev in devices:
+                try:
+                    idx = int(dev["index"])
+                    name = str(dev.get("name", f"Périphérique {idx}"))
+                    is_default = bool(dev.get("default", False))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                label = f"{name}  ✓ défaut système" if is_default else name
+                self.cb_mic.addItem(label, idx)
+            self.lb_mic_hint.setText(
+                "« Micro système par défaut » suit le réglage du système. "
+                "Sélectionnez un périphérique précis pour le forcer."
+            )
+        else:
+            self.cb_mic.setEnabled(False)
+            self.lb_mic_hint.setText(
+                "Détection indisponible — le micro système par défaut sera utilisé."
+            )
+
+        # Restaure la sélection si elle existe encore, sinon défaut (index 0).
+        if current is None:
+            self.cb_mic.setCurrentIndex(0)
+        else:
+            pos = self.cb_mic.findData(current)
+            self.cb_mic.setCurrentIndex(pos if pos >= 0 else 0)
+        self.cb_mic.blockSignals(False)
 
     def _on_autostart_toggle(self, state):
         from core import autostart
@@ -716,6 +824,24 @@ class SettingsWindow(QDialog):
         self.cb_model.setCurrentIndex(idx)
         self.lb_model_desc.setText(MODELS[idx][2])
 
+        # Vitesse / Qualité (beam_size) : > vitesse ⇒ Qualité, sinon Vitesse.
+        try:
+            beam = int(cfg.get("beam_size", BEAM_PRESETS["speed"]))
+        except (TypeError, ValueError):
+            beam = BEAM_PRESETS["speed"]
+        if beam <= BEAM_PRESETS["speed"]:
+            self.rb_speed.setChecked(True)
+        else:
+            self.rb_quality.setChecked(True)
+
+        # Micro : sélectionne l'index périphérique enregistré (None = défaut).
+        dev = cfg.get("input_device", None)
+        if dev is None:
+            self.cb_mic.setCurrentIndex(0)
+        else:
+            pos = self.cb_mic.findData(dev)
+            self.cb_mic.setCurrentIndex(pos if pos >= 0 else 0)
+
         # Touche
         if not IS_MAC:
             wk = cfg.get("win_key", "ctrl_r")
@@ -753,6 +879,13 @@ class SettingsWindow(QDialog):
         cfg["model"]        = self.cb_model.currentData()
         if not IS_MAC:
             cfg["win_key"]  = self.cb_winkey.currentData()
+
+        # Vitesse / Qualité → beam_size
+        cfg["beam_size"] = (BEAM_PRESETS["quality"] if self.rb_quality.isChecked()
+                            else BEAM_PRESETS["speed"])
+
+        # Micro : None (défaut système) ou index périphérique
+        cfg["input_device"] = self.cb_mic.currentData()
 
         # Position
         for btn in self.bg_pos.buttons():

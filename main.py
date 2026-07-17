@@ -12,13 +12,16 @@ CONFIG_DIR  = os.path.expanduser("~/.voxaho")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 DEFAULT_CONFIG = {
-    "language":     "fr",
-    "model":        "small",
-    "reformatting": True,
-    "first_run":    True,
-    "bar_x":        None,
-    "bar_y":        None,
-    "win_key":      "ctrl_r",   # Windows uniquement
+    "language":        "fr",
+    "model":           "small",
+    "reformatting":    True,
+    "first_run":       True,
+    "bar_x":           None,
+    "bar_y":           None,
+    "win_key":         "ctrl_r",   # Windows uniquement
+    "input_device":    None,       # index micro (None = périphérique système par défaut)
+    "beam_size":       1,          # faster-whisper beam search (1 = greedy, le plus rapide)
+    "compute_backend": "auto",     # "auto" | "cpu" | "mlx" (fixé au constructeur du Transcriber)
 }
 
 

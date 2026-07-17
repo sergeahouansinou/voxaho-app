@@ -1,14 +1,21 @@
 """
-Transcription locale via faster-whisper + reformatage du texte.
-Le modèle est chargé en lazy (premier appel) et protégé par un lock
-pour éviter les race conditions lors des changements de modèle à chaud.
+Transcription locale via faster-whisper (ou MLX sur Apple Silicon) + reformatage.
+Le modèle est chargé en lazy (premier appel) ou explicitement via preload(),
+et protégé par un lock pour éviter les race conditions lors des changements
+de modèle à chaud.
+
+Phase 0 « Vitesse foudroyante » :
+- L'audio (np.ndarray float32 mono 16 kHz) est passé DIRECTEMENT au moteur —
+  plus aucun fichier WAV temporaire (gain 50-200 ms).
+- beam_size configurable (défaut 1 = greedy, le plus rapide).
+- preload() charge le modèle + warmup pour rendre la 1ʳᵉ dictée quasi instantanée.
+- Backend MLX optionnel (Apple Silicon) avec fallback CPU garanti.
 """
 
-import os
 import re
-import wave
 import logging
-import tempfile
+import platform
+import importlib.util
 import threading
 import numpy as np
 
@@ -117,13 +124,74 @@ def _is_hallucination(text: str) -> bool:
     return False
 
 
+# ── Sélection du backend de calcul ───────────────────────────────────────────
+
+# Mapping nom de modèle → repo Hugging Face MLX pour le chemin Apple Silicon.
+# NOTE : ces repos sont « à valider sur Apple Silicon avec mlx-whisper installé » ;
+# ce Mac de test n'a pas mlx_whisper, le chemin MLX n'est donc pas exercé ici.
+MLX_MODEL_REPOS = {
+    "tiny":            "mlx-community/whisper-tiny-mlx",
+    "base":            "mlx-community/whisper-base-mlx",
+    "small":           "mlx-community/whisper-small-mlx",
+    "medium":          "mlx-community/whisper-medium-mlx",
+    "large-v3":        "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo":  "mlx-community/whisper-large-v3-turbo",
+    "distil-large-v3": "mlx-community/distil-whisper-large-v3",
+}
+
+
+def _mlx_whisper_available() -> bool:
+    """True si le module `mlx_whisper` est importable (sans l'importer réellement)."""
+    try:
+        return importlib.util.find_spec("mlx_whisper") is not None
+    except Exception:
+        return False
+
+
+def select_backend(requested: str, *, is_darwin: bool, is_arm64: bool,
+                   mlx_available: bool) -> str:
+    """Choisit le backend effectif, de façon PURE et déterministe (sans effet de bord).
+
+    Retourne "mlx" ou "cpu".
+    - "cpu"  : force toujours faster-whisper CPU (chemin garanti).
+    - "mlx"  : force MLX si disponible, sinon fallback "cpu".
+    - "auto" : MLX seulement si macOS + arm64 + module mlx_whisper présent ;
+               sinon "cpu" (fallback garanti, ne casse jamais).
+    """
+    if requested == "cpu":
+        return "cpu"
+    if requested == "mlx":
+        return "mlx" if mlx_available else "cpu"
+    # requested == "auto" (ou toute valeur inconnue → comportement sûr par défaut)
+    if is_darwin and is_arm64 and mlx_available:
+        return "mlx"
+    return "cpu"
+
+
 class Transcriber:
-    def __init__(self, model: str = "small", language: str = "fr", reformatting: bool = True):
-        self.model_name  = model
-        self.language    = None if language == "auto" else language
+    def __init__(self, model: str = "small", language: str = "fr",
+                 reformatting: bool = True, beam_size: int = 1,
+                 backend: str = "auto"):
+        self.model_name   = model
+        self.language     = None if language == "auto" else language
         self.reformatting = reformatting
-        self._model      = None
-        self._model_lock = threading.Lock()
+        self.beam_size    = beam_size
+        self.backend_requested = backend
+        self._model       = None
+        self._model_lock  = threading.Lock()
+
+        # Résolution du backend effectif (déterministe). Sur ce Mac (arm64 sans
+        # mlx_whisper) → "cpu" : le chemin faster-whisper reste 100 % fonctionnel.
+        self._backend = select_backend(
+            backend,
+            is_darwin=(platform.system() == "Darwin"),
+            is_arm64=(platform.machine() in ("arm64", "aarch64")),
+            mlx_available=_mlx_whisper_available(),
+        )
+        if backend == "mlx" and self._backend != "mlx":
+            logger.warning(
+                "Backend MLX demandé mais mlx_whisper introuvable → fallback CPU (faster-whisper)."
+            )
 
     # ── Chargement du modèle ──────────────────────────────────────────────────
 
@@ -154,67 +222,143 @@ class Transcriber:
                 self.model_name = model_name
                 self._model     = None
 
+    def update_settings(self, beam_size: int | None = None,
+                        language: str | None = None,
+                        reformatting: bool | None = None):
+        """Met à jour à chaud beam_size / language / reformatting (thread-safe).
+
+        Les paramètres laissés à None ne sont pas modifiés. Ne recharge PAS le
+        modèle (contrairement à update_model) : ces réglages sont lus à chaque
+        transcription. Les attributs restent aussi modifiables directement.
+        """
+        with self._model_lock:
+            if beam_size is not None:
+                self.beam_size = beam_size
+            if language is not None:
+                self.language = None if language == "auto" else language
+            if reformatting is not None:
+                self.reformatting = reformatting
+
+    def preload(self):
+        """Charge le modèle ET fait un warmup (transcrit ~0.5 s de silence) pour
+        forcer l'allocation mémoire et le JIT : la 1ʳᵉ dictée réelle devient quasi
+        instantanée.
+
+        Thread-safe (passe par transcribe() qui réutilise self._model_lock),
+        idempotent (le modèle est mis en cache), et ne LÈVE JAMAIS : tout échec
+        (dépendance absente, modèle introuvable…) est simplement loggé, le modèle
+        sera rechargé au 1er usage réel. Peut donc tourner dans un thread daemon.
+        """
+        try:
+            warmup_audio = np.zeros(8000, dtype=np.float32)  # 0,5 s de silence @ 16 kHz
+            # Même chemin que transcribe() → charge réellement le modèle du backend
+            # choisi et déclenche le warmup (allocation + JIT).
+            self.transcribe(warmup_audio)
+            logger.info("preload(): modèle '%s' chargé et réchauffé (backend=%s).",
+                        self.model_name, self._backend)
+        except Exception as e:
+            logger.warning(f"preload() a échoué (le modèle sera chargé au 1er usage): {e}")
+
     # ── Transcription ─────────────────────────────────────────────────────────
 
     def transcribe(self, audio_array: np.ndarray) -> str:
         if audio_array is None or len(audio_array) == 0:
             return ""
 
-        with self._model_lock:
-            # Capturer une référence locale SOUS le lock. Si update_model() réassigne
-            # self._model pendant la transcription, on garde le modèle courant vivant
-            # jusqu'à la fin de l'appel (libération auto via refcount ensuite).
-            model = self._get_model()
+        # Numpy direct : faster-whisper ET mlx_whisper acceptent un np.ndarray
+        # float32 mono 16 kHz — plus aucun fichier WAV temporaire (gain 50-200 ms).
+        audio = np.ascontiguousarray(audio_array, dtype=np.float32)
 
-        tmp_path = self._write_wav(audio_array)
-        try:
-            segments, info = model.transcribe(
-                tmp_path,
-                language=self.language,
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 300},
-            )
-            # Filtrer les hallucinations de Whisper générées sur silence/bruit :
-            # segments quasi muets peu fiables + phrases fantômes de la blocklist.
-            textes = []
-            for seg in segments:
-                seg_text = seg.text.strip()
-                if not seg_text:
-                    continue
-                no_speech_prob = getattr(seg, "no_speech_prob", 0.0)
-                avg_logprob    = getattr(seg, "avg_logprob", 0.0)
-                if no_speech_prob > 0.6 and avg_logprob < -0.8:
-                    continue  # probablement du silence mal interprété
-                if _is_hallucination(seg_text):
-                    continue  # phrase fantôme connue (ex. crédits de sous-titres)
-                textes.append(seg_text)
-            text = " ".join(textes).strip()
-
-            detected_lang = info.language if self.language is None else self.language
-            if self.reformatting:
-                text = self._reformat(text, detected_lang)
-
-            return text
-
-        finally:
+        # Chaque backend renvoie une liste de tuples (texte, no_speech_prob,
+        # avg_logprob) + la langue détectée. Le filtrage et le reformatage qui
+        # suivent sont STRICTEMENT communs aux deux backends (comportement inchangé).
+        if self._backend == "mlx":
             try:
-                os.unlink(tmp_path)
-            except OSError as e:
-                logger.warning(f"Impossible de supprimer le fichier temp {tmp_path}: {e}")
+                raw_segments, detected_lang = self._transcribe_mlx(audio)
+            except Exception as e:
+                # Fallback garanti : le chemin CPU ne doit jamais casser.
+                logger.warning(f"Backend MLX indisponible à l'exécution → fallback CPU: {e}")
+                self._backend = "cpu"
+                raw_segments, detected_lang = self._transcribe_cpu(audio)
+        else:
+            raw_segments, detected_lang = self._transcribe_cpu(audio)
 
-    # ── Audio → WAV ───────────────────────────────────────────────────────────
+        # Filtrer les hallucinations de Whisper générées sur silence/bruit :
+        # segments quasi muets peu fiables + phrases fantômes de la blocklist.
+        textes = []
+        for seg_text, no_speech_prob, avg_logprob in raw_segments:
+            seg_text = seg_text.strip()
+            if not seg_text:
+                continue
+            if no_speech_prob > 0.6 and avg_logprob < -0.8:
+                continue  # probablement du silence mal interprété
+            if _is_hallucination(seg_text):
+                continue  # phrase fantôme connue (ex. crédits de sous-titres)
+            textes.append(seg_text)
+        text = " ".join(textes).strip()
 
-    def _write_wav(self, audio: np.ndarray) -> str:
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        tmp.close()
-        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
-        with wave.open(tmp.name, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(pcm.tobytes())
-        return tmp.name
+        detected_lang = detected_lang if self.language is None else self.language
+        if self.reformatting:
+            text = self._reformat(text, detected_lang)
+
+        return text
+
+    # ── Backends ────────────────────────────────────────────────────────────────
+
+    def _transcribe_cpu(self, audio: np.ndarray):
+        """Chemin faster-whisper CPU int8 (garanti). Renvoie (segments_bruts, langue)."""
+        with self._model_lock:
+            # Capturer les références locales SOUS le lock. Si update_model()/
+            # update_settings() modifie l'état pendant la transcription, on garde
+            # le modèle courant vivant jusqu'à la fin de l'appel.
+            model     = self._get_model()
+            language  = self.language
+            beam_size = self.beam_size
+
+        segments, info = model.transcribe(
+            audio,
+            language=language,
+            beam_size=beam_size,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 300},
+        )
+        raw = [
+            (
+                seg.text,
+                getattr(seg, "no_speech_prob", 0.0),
+                getattr(seg, "avg_logprob", 0.0),
+            )
+            for seg in segments
+        ]
+        return raw, info.language
+
+    def _transcribe_mlx(self, audio: np.ndarray):
+        """Chemin MLX (Apple Silicon). Renvoie (segments_bruts, langue).
+
+        NOTE : « à valider sur Apple Silicon avec mlx-whisper installé ». mlx_whisper
+        n'est pas une dépendance dure (import protégé) ; absent, on ne passe jamais ici.
+        """
+        import mlx_whisper  # import protégé : jamais requis si backend != mlx
+
+        repo = MLX_MODEL_REPOS.get(
+            self.model_name, f"mlx-community/whisper-{self.model_name}-mlx"
+        )
+        result = mlx_whisper.transcribe(
+            audio,
+            path_or_hf_repo=repo,
+            language=self.language,
+            # beam_size n'est pas exposé de la même façon par mlx_whisper : on
+            # conserve ses défauts (décodage greedy), cohérent avec la cible vitesse.
+        )
+        raw = [
+            (
+                seg.get("text", ""),
+                seg.get("no_speech_prob", 0.0),
+                seg.get("avg_logprob", 0.0),
+            )
+            for seg in result.get("segments", [])
+        ]
+        return raw, result.get("language", self.language)
 
     # ── Reformatage ───────────────────────────────────────────────────────────
 

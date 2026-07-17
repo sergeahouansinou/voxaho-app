@@ -299,6 +299,10 @@ class SetupWizard(QDialog):
             "first_run":    False,
             "bar_x":        None,
             "bar_y":        None,
+            # Réglages vitesse (Phase 0) : cohérence avec les Préférences.
+            # beam_size 1 = « Vitesse » ; input_device None = micro système.
+            "beam_size":    1,
+            "input_device": None,
         }
         self._mic_timer: QTimer | None = None
         self._mic_stream = None
@@ -543,15 +547,17 @@ class SetupWizard(QDialog):
         lbl_model.setObjectName("section")
         lay.addWidget(lbl_model)
         lay.addSpacing(4)
-        perf_hint = "Sur M5 : 'small' ≈ 0,8 s · 'medium' ≈ 2 s · 'large-v3' ≈ 4 s" if IS_MAC else "'small' recommandé · 'large-v3' plus précis mais plus lent"
+        perf_hint = "Sur M5 : 'small' ≈ 0,8 s · 'large-v3-turbo' ≈ 1 s · 'large-v3' ≈ 4 s" if IS_MAC else "'large-v3-turbo' recommandé (quasi-max, rapide) · 'small' plus léger"
         hint_model = QLabel(perf_hint); hint_model.setObjectName("hint")
         lay.addWidget(hint_model)
         lay.addSpacing(6)
+        # Liste alignée sur settings_window.MODELS (mêmes codes/currentData).
         self.model_combo = QComboBox()
-        self.model_combo.addItem("tiny     — Ultra rapide (moins précis)",    "tiny")
-        self.model_combo.addItem("small    — Rapide et précis  ✓ Recommandé", "small")
-        self.model_combo.addItem("medium   — Très précis",                    "medium")
-        self.model_combo.addItem("large-v3 — Meilleure qualité",              "large-v3")
+        self.model_combo.addItem("tiny            — Ultra rapide (moins précis)",       "tiny")
+        self.model_combo.addItem("small           — Léger et rapide",                   "small")
+        self.model_combo.addItem("medium          — Très précis",                       "medium")
+        self.model_combo.addItem("large-v3-turbo  — Quasi-max, très rapide  ✓ Recommandé", "large-v3-turbo")
+        self.model_combo.addItem("large-v3        — Meilleure qualité",                 "large-v3")
         self.model_combo.setCurrentIndex(1)
         lay.addWidget(self.model_combo)
         lay.addSpacing(20)

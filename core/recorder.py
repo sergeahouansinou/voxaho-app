@@ -16,8 +16,43 @@ DTYPE       = "float32"
 MIN_SECONDS = 0.1   # ignore les appuis accidentels < 0.1 s
 
 
+def list_input_devices() -> list[dict]:
+    """Liste les périphériques d'ENTRÉE audio disponibles.
+
+    Retourne [{"index": int, "name": str, "default": bool}] pour les seuls
+    périphériques ayant max_input_channels > 0. Tolérant aux erreurs : renvoie
+    [] si sounddevice est indisponible ou si la requête échoue (l'UI l'importe).
+    """
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        logger.warning(f"list_input_devices(): sounddevice indisponible ({e})")
+        return []
+
+    # Index du micro par défaut (sd.default.device = [entrée, sortie]).
+    default_input = None
+    try:
+        default_input = sd.default.device[0]
+    except Exception:
+        default_input = None
+
+    result = []
+    for index, dev in enumerate(devices):
+        try:
+            if dev.get("max_input_channels", 0) > 0:
+                result.append({
+                    "index": index,
+                    "name": dev.get("name", f"Device {index}"),
+                    "default": (index == default_input),
+                })
+        except Exception:
+            continue  # device malformé → on l'ignore, sans casser la liste
+    return result
+
+
 class Recorder:
-    def __init__(self):
+    def __init__(self, device=None):
+        self._device  = device  # index sounddevice ; None = périphérique système par défaut
         self._frames  = []
         self._stream  = None
         self._active  = False
@@ -35,6 +70,7 @@ class Recorder:
                 channels=CHANNELS,
                 dtype=DTYPE,
                 blocksize=1024,
+                device=self._device,
                 callback=self._callback,
             )
             self._stream.start()
