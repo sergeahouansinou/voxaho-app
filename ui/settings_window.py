@@ -43,12 +43,54 @@ ACCENTS = {
 
 MINI_SIZES = {"small": 30, "medium": 40, "large": 52}
 
+# Langues de dictée exposées dans l'UI (source unique, importée par le wizard).
+# Chaque code est un code langue Whisper ISO-639-1 réellement supporté par le
+# moteur (faster-whisper reconnaît ~100 langues nativement).
+# Ordre : 1) langues prioritaires fr/en/es/de/it, 2) le reste par ordre
+# alphabétique du nom natif (latin puis autres écritures), 3) « Auto » en fin.
+# Chaque label = drapeau emoji + nom NATIF de la langue.
 LANGS = [
+    # ── Langues prioritaires ─────────────────────────────────────────────
     ("fr",   "🇫🇷  Français"),
     ("en",   "🇬🇧  English"),
     ("es",   "🇪🇸  Español"),
     ("de",   "🇩🇪  Deutsch"),
     ("it",   "🇮🇹  Italiano"),
+    # ── Écriture latine (ordre alphabétique du nom natif) ────────────────
+    ("id",   "🇮🇩  Bahasa Indonesia"),
+    ("ms",   "🇲🇾  Bahasa Melayu"),
+    ("ca",   "🇦🇩  Català"),
+    ("cs",   "🇨🇿  Čeština"),
+    ("da",   "🇩🇰  Dansk"),
+    ("hr",   "🇭🇷  Hrvatski"),
+    ("hu",   "🇭🇺  Magyar"),
+    ("nl",   "🇳🇱  Nederlands"),
+    ("no",   "🇳🇴  Norsk"),
+    ("pl",   "🇵🇱  Polski"),
+    ("pt",   "🇵🇹  Português"),
+    ("ro",   "🇷🇴  Română"),
+    ("sk",   "🇸🇰  Slovenčina"),
+    ("sl",   "🇸🇮  Slovenščina"),
+    ("fi",   "🇫🇮  Suomi"),
+    ("sv",   "🇸🇪  Svenska"),
+    ("vi",   "🇻🇳  Tiếng Việt"),
+    ("tr",   "🇹🇷  Türkçe"),
+    # ── Autres écritures (grec, cyrillique, hébreu, arabe, indiennes, CJK) ─
+    ("el",   "🇬🇷  Ελληνικά"),
+    ("bg",   "🇧🇬  Български"),
+    ("ru",   "🇷🇺  Русский"),
+    ("sr",   "🇷🇸  Српски"),
+    ("uk",   "🇺🇦  Українська"),
+    ("he",   "🇮🇱  עברית"),
+    ("ar",   "🇸🇦  العربية"),
+    ("fa",   "🇮🇷  فارسی"),
+    ("hi",   "🇮🇳  हिन्दी"),
+    ("ta",   "🇮🇳  தமிழ்"),
+    ("th",   "🇹🇭  ไทย"),
+    ("zh",   "🇨🇳  中文"),
+    ("ja",   "🇯🇵  日本語"),
+    ("ko",   "🇰🇷  한국어"),
+    # ── Détection automatique ────────────────────────────────────────────
     ("auto", "🌍  Auto"),
 ]
 

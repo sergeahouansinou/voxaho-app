@@ -171,12 +171,16 @@ def select_backend(requested: str, *, is_darwin: bool, is_arm64: bool,
 class Transcriber:
     def __init__(self, model: str = "small", language: str = "fr",
                  reformatting: bool = True, beam_size: int = 1,
-                 backend: str = "auto"):
+                 backend: str = "auto", postprocess: bool = True):
         self.model_name   = model
         self.language     = None if language == "auto" else language
         self.reformatting = reformatting
         self.beam_size    = beam_size
         self.backend_requested = backend
+        # Post-traitement « intelligence locale » : amorce Whisper depuis le
+        # dictionnaire perso + correction des termes + expansion des snippets.
+        # Activé par défaut ; se désactive pour retrouver le comportement brut.
+        self.postprocess  = postprocess
         self._model       = None
         self._model_lock  = threading.Lock()
 
@@ -269,6 +273,10 @@ class Transcriber:
         # float32 mono 16 kHz — plus aucun fichier WAV temporaire (gain 50-200 ms).
         audio = np.ascontiguousarray(audio_array, dtype=np.float32)
 
+        # Amorce Whisper issue du dictionnaire personnel (ou None). Défensif :
+        # tout échec du module dico → None → comportement d'origine intact.
+        initial_prompt = self._dictionary_prompt()
+
         # Chaque backend renvoie une liste de tuples (texte, no_speech_prob,
         # avg_logprob) + la langue détectée. Le filtrage et le reformatage qui
         # suivent sont STRICTEMENT communs aux deux backends (comportement inchangé).
@@ -279,9 +287,9 @@ class Transcriber:
                 # Fallback garanti : le chemin CPU ne doit jamais casser.
                 logger.warning(f"Backend MLX indisponible à l'exécution → fallback CPU: {e}")
                 self._backend = "cpu"
-                raw_segments, detected_lang = self._transcribe_cpu(audio)
+                raw_segments, detected_lang = self._transcribe_cpu(audio, initial_prompt)
         else:
-            raw_segments, detected_lang = self._transcribe_cpu(audio)
+            raw_segments, detected_lang = self._transcribe_cpu(audio, initial_prompt)
 
         # Filtrer les hallucinations de Whisper générées sur silence/bruit :
         # segments quasi muets peu fiables + phrases fantômes de la blocklist.
@@ -301,12 +309,61 @@ class Transcriber:
         if self.reformatting:
             text = self._reformat(text, detected_lang)
 
+        # Post-traitement « intelligence locale », EN AVAL du reformatage et
+        # uniquement si activé : correction des termes du dico puis expansion des
+        # snippets. Défensif (voir _apply_postprocessing).
+        if self.postprocess and text:
+            text = self._apply_postprocessing(text)
+
+        return text
+
+    # ── Intelligence locale (dictionnaire + snippets) ────────────────────────────
+
+    def _dictionary_prompt(self):
+        """Amorce Whisper issue du dictionnaire personnel, ou None.
+
+        Import différé + défensif : si le module dictionnaire est indisponible
+        (absent, base illisible, prompt vide…), retourne None → `initial_prompt`
+        n'est pas transmis et le comportement d'origine est conservé. N'agit que
+        si le post-traitement est activé (self.postprocess).
+        """
+        if not self.postprocess:
+            return None
+        try:
+            from core import dictionary
+            prompt = dictionary.whisper_prompt()
+            return prompt or None
+        except Exception as e:  # pragma: no cover - purement défensif
+            logger.debug("whisper_prompt indisponible, initial_prompt ignoré: %s", e)
+            return None
+
+    def _apply_postprocessing(self, text: str) -> str:
+        """Applique dictionary.correct_text puis snippets.expand_text, dans cet ordre.
+
+        Chaque brique est isolée (import différé + try/except) : l'échec d'un
+        module d'intelligence n'affecte jamais la dictée — on renvoie toujours le
+        meilleur texte obtenu jusque-là.
+        """
+        try:
+            from core import dictionary
+            text = dictionary.correct_text(text)
+        except Exception as e:  # pragma: no cover - purement défensif
+            logger.debug("correct_text ignoré: %s", e)
+        try:
+            from core import snippets
+            text = snippets.expand_text(text)
+        except Exception as e:  # pragma: no cover - purement défensif
+            logger.debug("expand_text ignoré: %s", e)
         return text
 
     # ── Backends ────────────────────────────────────────────────────────────────
 
-    def _transcribe_cpu(self, audio: np.ndarray):
-        """Chemin faster-whisper CPU int8 (garanti). Renvoie (segments_bruts, langue)."""
+    def _transcribe_cpu(self, audio: np.ndarray, initial_prompt: str | None = None):
+        """Chemin faster-whisper CPU int8 (garanti). Renvoie (segments_bruts, langue).
+
+        `initial_prompt` (amorce issue du dictionnaire perso) est transmis tel
+        quel à faster-whisper ; None = aucune amorce (comportement d'origine).
+        """
         with self._model_lock:
             # Capturer les références locales SOUS le lock. Si update_model()/
             # update_settings() modifie l'état pendant la transcription, on garde
@@ -319,6 +376,7 @@ class Transcriber:
             audio,
             language=language,
             beam_size=beam_size,
+            initial_prompt=initial_prompt,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 300},
         )

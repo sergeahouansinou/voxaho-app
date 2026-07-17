@@ -6,11 +6,13 @@ Notion : header workspace, navigation principale surlignée coin arrondi,
 séparateur, et bas de sidebar avec « Réglages ». La zone de droite est un
 QStackedWidget dont la page change selon la sélection de la sidebar.
 
-Sections : Accueil (dashboard), Historique, Notes, Statistiques.
+Sections : Accueil (dashboard), Historique, Notes, Dictionnaire, Snippets,
+Statistiques.
 
-La couche données (core.history / core.notes / core.stats) est fournie par un
-agent parallèle : TOUS les accès sont défensifs (try/except au niveau des
-méthodes). Si un module est indisponible, on affiche « Aucune donnée » au lieu
+La couche données (core.history / core.notes / core.stats / core.dictionary /
+core.snippets) est fournie par un agent parallèle : TOUS les accès sont
+défensifs (try/except au niveau des méthodes). Si un module est indisponible,
+on affiche « Aucune donnée » (ou « Aucun terme » / « Aucun snippet ») au lieu
 de crasher.
 
 Palette réutilisée telle quelle depuis ui/settings_window.py.
@@ -80,6 +82,20 @@ def truncate_text(s: str, n: int = 80) -> str:
     if len(s) <= n:
         return s
     return s[: n - 1].rstrip() + "…"
+
+
+def snippet_preview(trigger, expansion, n: int = 60) -> str:
+    """Représentation compacte « déclencheur → texte tronqué » (pour la liste).
+
+    Fonction pure, sans dépendance Qt. Normalise les espaces du déclencheur et
+    tronque l'expansion via truncate_text. Retourne une chaîne vide si les deux
+    champs sont vides.
+    """
+    trig = " ".join(str(trigger or "").split())
+    exp = truncate_text(expansion, n)
+    if not trig and not exp:
+        return ""
+    return f"{trig} → {exp}"
 
 
 def format_minutes(minutes) -> str:
@@ -303,10 +319,14 @@ class WorkspaceWindow(QMainWindow):
     dictation_added = pyqtSignal()
 
     # Index des pages dans le QStackedWidget (aligné sur l'ordre de la nav).
+    # Dictionnaire et Snippets sont insérés après Notes et avant Statistiques :
+    # cela décale l'index de Statistiques (3 → 5), d'où la mise à jour ici.
     PAGE_HOME = 0
     PAGE_HISTORY = 1
     PAGE_NOTES = 2
-    PAGE_STATS = 3
+    PAGE_DICTIONARY = 3
+    PAGE_SNIPPETS = 4
+    PAGE_STATS = 5
 
     def __init__(self, config: dict, save_config_fn, open_settings_fn=None):
         super().__init__()
@@ -319,6 +339,9 @@ class WorkspaceWindow(QMainWindow):
         # leur parent, et on conserve la référence pour les manipuler/sauver).
         self._current_note_id = None
         self._loading_note = False  # gate l'auto-save pendant le chargement
+
+        # État Snippets : id du snippet en cours d'édition (None = mode ajout).
+        self._editing_snippet_id = None
 
         self._setup_ui()
         self.dictation_added.connect(self.refresh)
@@ -343,11 +366,16 @@ class WorkspaceWindow(QMainWindow):
         content_lay.setContentsMargins(0, 0, 0, 0)
         content_lay.setSpacing(0)
 
+        # L'ordre des addWidget DOIT rester synchronisé avec l'ordre des items
+        # de la nav (cf. _build_sidebar) : la sélection de la sidebar pilote
+        # directement stack.setCurrentIndex(row).
         self.stack = QStackedWidget()
-        self.stack.addWidget(self._build_dashboard_page())   # 0
-        self.stack.addWidget(self._build_history_page())     # 1
-        self.stack.addWidget(self._build_notes_page())       # 2
-        self.stack.addWidget(self._build_stats_page())       # 3
+        self.stack.addWidget(self._build_dashboard_page())    # 0
+        self.stack.addWidget(self._build_history_page())      # 1
+        self.stack.addWidget(self._build_notes_page())        # 2
+        self.stack.addWidget(self._build_dictionary_page())   # 3
+        self.stack.addWidget(self._build_snippets_page())     # 4
+        self.stack.addWidget(self._build_stats_page())        # 5
         content_lay.addWidget(self.stack, 1)
         root.addWidget(content, 1)
 
@@ -380,7 +408,9 @@ class WorkspaceWindow(QMainWindow):
         self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.nav.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        for label in ["🏠  Accueil", "🕘  Historique", "📝  Notes", "📊  Statistiques"]:
+        # Ordre synchronisé avec l'ajout des pages au QStackedWidget (_setup_ui).
+        for label in ["🏠  Accueil", "🕘  Historique", "📝  Notes",
+                      "📖  Dictionnaire", "⚡  Snippets", "📊  Statistiques"]:
             it = QListWidgetItem(label)
             it.setSizeHint(QSize(0, 42))
             self.nav.addItem(it)
@@ -824,7 +854,227 @@ class WorkspaceWindow(QMainWindow):
         self.note_title.setEnabled(on)
         self.note_body.setEnabled(on)
 
-    # ── Page 4 : Statistiques ─────────────────────────────────────────────────
+    # ── Page 4 : Dictionnaire ─────────────────────────────────────────────────
+    def _build_dictionary_page(self) -> QWidget:
+        w, lay = self._page(
+            "Dictionnaire",
+            "Vos termes, noms propres et jargon — mieux reconnus et corrigés "
+            "automatiquement",
+        )
+
+        # Barre d'ajout : champ + bouton « + Ajouter » (en haut).
+        # Anti-GC : conservé comme attribut d'instance.
+        add_row = QHBoxLayout()
+        add_row.setSpacing(10)
+        self.dict_input = QLineEdit()
+        self.dict_input.setPlaceholderText("Nouveau terme, nom propre, jargon…")
+        self.dict_input.returnPressed.connect(self._on_add_term)
+        add_row.addWidget(self.dict_input, 1)
+        btn_add = QPushButton("+  Ajouter", objectName="primary")
+        btn_add.clicked.connect(self._on_add_term)
+        add_row.addWidget(btn_add)
+        lay.addLayout(add_row)
+
+        # Liste défilante des termes (cartes reconstruites à chaque refresh).
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self._dict_container = QWidget()
+        self._dict_lay = QVBoxLayout(self._dict_container)
+        self._dict_lay.setContentsMargins(0, 0, 8, 0)
+        self._dict_lay.setSpacing(8)
+        self._dict_lay.addStretch(1)
+        scroll.setWidget(self._dict_container)
+        lay.addWidget(scroll, 1)
+
+        return w
+
+    def _refresh_dictionary(self):
+        """Recharge la liste des termes du dictionnaire (état vide géré)."""
+        self._clear_layout(self._dict_lay, keep_last_stretch=True)
+        terms = self._safe_call("dictionary", "list_terms", default=None)
+        if terms is None:
+            self._insert_before_stretch(
+                self._dict_lay,
+                QLabel("Aucun terme — dictionnaire indisponible.", objectName="empty"))
+            return
+        if not terms:
+            self._insert_before_stretch(
+                self._dict_lay,
+                QLabel("Aucun terme pour le moment.", objectName="empty"))
+            return
+        for t in terms:
+            self._insert_before_stretch(self._dict_lay, self._term_card(t))
+
+    def _term_card(self, term: dict) -> QWidget:
+        """Carte d'un terme : libellé + bouton supprimer (suppression directe)."""
+        tid = term.get("id")
+        card = QFrame(objectName="entry")
+        cl = QHBoxLayout(card)
+        cl.setContentsMargins(14, 10, 14, 10)
+        cl.setSpacing(6)
+        lbl = QLabel(str(term.get("term", "")), objectName="entry-text")
+        lbl.setWordWrap(True)
+        cl.addWidget(lbl, 1)
+        btn_del = QPushButton("🗑", objectName="icon")
+        btn_del.setToolTip("Supprimer")
+        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del.clicked.connect(lambda _=False, i=tid: self._delete_term(i))
+        cl.addWidget(btn_del)
+        return card
+
+    def _on_add_term(self):
+        term = self.dict_input.text().strip()
+        if not term:
+            return
+        new_id = self._safe_call("dictionary", "add_term", default=None, _args=(term,))
+        if new_id is None:
+            QMessageBox.warning(self, "Dictionnaire",
+                                "Impossible d'ajouter ce terme (module indisponible).")
+            return
+        self.dict_input.clear()
+        self._refresh_dictionary()
+
+    def _delete_term(self, term_id):
+        # Items anodins : suppression directe, sans confirmation.
+        if term_id is None:
+            return
+        self._safe_call("dictionary", "remove_term", default=None, _args=(term_id,))
+        self._refresh_dictionary()
+
+    # ── Page 5 : Snippets ─────────────────────────────────────────────────────
+    def _build_snippets_page(self) -> QWidget:
+        w, lay = self._page(
+            "Snippets", "Dites un déclencheur, Voxaho écrit le texte complet")
+
+        # Formulaire d'ajout / édition (carte). Anti-GC : attributs d'instance.
+        form = QFrame(objectName="card")
+        fl = QVBoxLayout(form)
+        fl.setContentsMargins(16, 14, 16, 14)
+        fl.setSpacing(10)
+        self.snip_trigger = QLineEdit()
+        self.snip_trigger.setPlaceholderText("Déclencheur (ex. « ma signature »)")
+        fl.addWidget(self.snip_trigger)
+        self.snip_expansion = QTextEdit()
+        self.snip_expansion.setPlaceholderText("Texte complet à écrire…")
+        self.snip_expansion.setFixedHeight(90)
+        fl.addWidget(self.snip_expansion)
+
+        form_actions = QHBoxLayout()
+        form_actions.addStretch(1)
+        self.snip_cancel = QPushButton("Annuler", objectName="ghost")
+        self.snip_cancel.clicked.connect(self._cancel_snippet_edit)
+        self.snip_cancel.setVisible(False)  # visible seulement en mode édition
+        form_actions.addWidget(self.snip_cancel)
+        self.snip_add_btn = QPushButton("+  Ajouter", objectName="primary")
+        self.snip_add_btn.clicked.connect(self._on_save_snippet)
+        form_actions.addWidget(self.snip_add_btn)
+        fl.addLayout(form_actions)
+        lay.addWidget(form)
+
+        # Liste défilante des snippets (reconstruite à chaque refresh).
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self._snip_container = QWidget()
+        self._snip_lay = QVBoxLayout(self._snip_container)
+        self._snip_lay.setContentsMargins(0, 0, 8, 0)
+        self._snip_lay.setSpacing(8)
+        self._snip_lay.addStretch(1)
+        scroll.setWidget(self._snip_container)
+        lay.addWidget(scroll, 1)
+
+        return w
+
+    def _refresh_snippets(self):
+        """Recharge la liste des snippets (état vide géré)."""
+        self._clear_layout(self._snip_lay, keep_last_stretch=True)
+        snippets = self._safe_call("snippets", "list_snippets", default=None)
+        if snippets is None:
+            self._insert_before_stretch(
+                self._snip_lay,
+                QLabel("Aucun snippet — module indisponible.", objectName="empty"))
+            return
+        if not snippets:
+            self._insert_before_stretch(
+                self._snip_lay,
+                QLabel("Aucun snippet pour le moment.", objectName="empty"))
+            return
+        for s in snippets:
+            self._insert_before_stretch(self._snip_lay, self._snippet_card(s))
+
+    def _snippet_card(self, snippet: dict) -> QWidget:
+        """Carte d'un snippet : « trigger → expansion » tronqué + éditer/supprimer."""
+        sid = snippet.get("id")
+        card = QFrame(objectName="entry")
+        cl = QHBoxLayout(card)
+        cl.setContentsMargins(14, 10, 14, 10)
+        cl.setSpacing(6)
+        lbl = QLabel(
+            snippet_preview(snippet.get("trigger", ""), snippet.get("expansion", "")),
+            objectName="entry-text")
+        lbl.setWordWrap(True)
+        cl.addWidget(lbl, 1)
+
+        btn_edit = QPushButton("✏️", objectName="icon")
+        btn_edit.setToolTip("Éditer")
+        btn_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_edit.clicked.connect(lambda _=False, s=snippet: self._edit_snippet(s))
+        cl.addWidget(btn_edit)
+
+        btn_del = QPushButton("🗑", objectName="icon")
+        btn_del.setToolTip("Supprimer")
+        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del.clicked.connect(lambda _=False, i=sid: self._delete_snippet(i))
+        cl.addWidget(btn_del)
+        return card
+
+    def _on_save_snippet(self):
+        """Ajoute (mode ajout) ou met à jour (mode édition) le snippet du formulaire."""
+        trigger = self.snip_trigger.text().strip()
+        expansion = self.snip_expansion.toPlainText().strip()
+        if not trigger or not expansion:
+            return
+        if self._editing_snippet_id is not None:
+            self._safe_call(
+                "snippets", "update_snippet", default=None,
+                _args=(self._editing_snippet_id,),
+                _kwargs={"trigger": trigger, "expansion": expansion})
+        else:
+            new_id = self._safe_call(
+                "snippets", "add_snippet", default=None, _args=(trigger, expansion))
+            if new_id is None:
+                QMessageBox.warning(self, "Snippets",
+                                    "Impossible d'ajouter ce snippet (module indisponible).")
+                return
+        self._cancel_snippet_edit()  # réinitialise le formulaire + le mode
+        self._refresh_snippets()
+
+    def _edit_snippet(self, snippet: dict):
+        """Recharge un snippet dans le formulaire (passe en mode édition)."""
+        self._editing_snippet_id = snippet.get("id")
+        self.snip_trigger.setText(str(snippet.get("trigger", "") or ""))
+        self.snip_expansion.setPlainText(str(snippet.get("expansion", "") or ""))
+        self.snip_add_btn.setText("Enregistrer")
+        self.snip_cancel.setVisible(True)
+        self.snip_trigger.setFocus()
+
+    def _cancel_snippet_edit(self):
+        """Réinitialise le formulaire et repasse en mode ajout."""
+        self._editing_snippet_id = None
+        self.snip_trigger.clear()
+        self.snip_expansion.clear()
+        self.snip_add_btn.setText("+  Ajouter")
+        self.snip_cancel.setVisible(False)
+
+    def _delete_snippet(self, snippet_id):
+        if snippet_id is None:
+            return
+        self._safe_call("snippets", "remove_snippet", default=None, _args=(snippet_id,))
+        # Si on supprimait le snippet en cours d'édition, on vide le formulaire.
+        if self._editing_snippet_id == snippet_id:
+            self._cancel_snippet_edit()
+        self._refresh_snippets()
+
+    # ── Page 6 : Statistiques ─────────────────────────────────────────────────
     def _build_stats_page(self) -> QWidget:
         w, lay = self._page("Statistiques", "Votre activité de dictée")
 
@@ -895,6 +1145,10 @@ class WorkspaceWindow(QMainWindow):
                 self._reload_history()
             elif idx == self.PAGE_NOTES:
                 self._reload_notes()
+            elif idx == self.PAGE_DICTIONARY:
+                self._refresh_dictionary()
+            elif idx == self.PAGE_SNIPPETS:
+                self._refresh_snippets()
             elif idx == self.PAGE_STATS:
                 self._refresh_stats()
         except Exception as e:  # jamais crasher la fenêtre sur un refresh
