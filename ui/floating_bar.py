@@ -325,12 +325,12 @@ class FloatingBar(QWidget):
         self._launch_preload()
 
     def _build_transcriber(self):
-        """Instancie un Transcriber avec la config courante (beam_size + backend).
+        """Instancie un Transcriber avec la config courante (beam_size + backend + ai_reformat).
 
         Défensif : si le constructeur de l'agent moteur ne connaît pas encore les
-        kwargs `beam_size`/`backend` (ordre d'arrivée des agents parallèles), on
-        retombe sur la signature minimale. Transitoire — à retirer une fois le
-        contrat moteur stabilisé.
+        kwargs `beam_size`/`backend`/`ai_reformat` (ordre d'arrivée des agents
+        parallèles), on retombe sur la signature minimale. Transitoire — à retirer
+        une fois le contrat moteur stabilisé.
         """
         from core.transcriber import Transcriber
         model        = self.config.get("model",           "small")
@@ -338,6 +338,7 @@ class FloatingBar(QWidget):
         reformatting = self.config.get("reformatting",    True)
         beam_size    = self.config.get("beam_size",       1)
         backend      = self.config.get("compute_backend", "auto")
+        ai_reformat  = self.config.get("ai_reformat",     False)
         try:
             return Transcriber(
                 model        = model,
@@ -345,10 +346,11 @@ class FloatingBar(QWidget):
                 reformatting = reformatting,
                 beam_size    = beam_size,
                 backend      = backend,
+                ai_reformat  = ai_reformat,
             )
         except TypeError:
             # Transitoire : constructeur moteur pas encore à jour → sans kwargs.
-            logger.warning("Transcriber sans kwargs beam_size/backend (contrat moteur transitoire)")
+            logger.warning("Transcriber sans kwargs beam_size/backend/ai_reformat (contrat moteur transitoire)")
             return Transcriber(
                 model        = model,
                 language     = language,
@@ -376,6 +378,27 @@ class FloatingBar(QWidget):
             self._transcriber.beam_size = beam_size
         except Exception as e:
             logger.warning(f"_apply_beam_size: {e}")
+
+    def _apply_ai_reformat(self, ai_reformat: bool):
+        """Applique ai_reformat à chaud : via update_settings si dispo, sinon setattr.
+
+        Contrairement à compute_backend (fixé au constructeur), le LLM est décidé
+        à l'exécution de transcribe() : nul besoin de recréer le Transcriber, un
+        simple réglage à chaud suffit. Le moteur retombe seul sur les règles si le
+        LLM n'est pas prêt.
+        """
+        update = getattr(self._transcriber, "update_settings", None)
+        if callable(update):
+            try:
+                update(ai_reformat=ai_reformat)
+                return
+            except TypeError:
+                pass  # transitoire : update_settings sans kwarg ai_reformat
+        # Repli : attribut direct (le moteur expose self.ai_reformat)
+        try:
+            self._transcriber.ai_reformat = ai_reformat
+        except Exception as e:
+            logger.warning(f"_apply_ai_reformat: {e}")
 
     def _recreate_transcriber(self):
         """Recrée le Transcriber (backend changé) : unload → new → preload.
@@ -449,6 +472,14 @@ class FloatingBar(QWidget):
         # Libérer le modèle Whisper (3+ GB de RAM)
         if self._transcriber:
             self._transcriber.unload_model()
+
+        # Libérer l'instance LLM du reformatage IA (défensif : import différé,
+        # fourni par un agent parallèle). Ne doit jamais bloquer la fermeture.
+        try:
+            from core import llm
+            llm.unload()
+        except Exception as e:
+            logger.warning(f"closeEvent — llm.unload: {e}")
 
         super().closeEvent(event)
 
@@ -1040,11 +1071,14 @@ class FloatingBar(QWidget):
             self._recreate_transcriber()
         else:
             # Hot-swap standard : langue + reformatage + modèle (existant),
-            # plus le beam_size (nouveau).
+            # plus le beam_size et ai_reformat (nouveaux). Le reformatage IA est
+            # décidé à l'exécution de transcribe() : pas besoin de recréer le
+            # Transcriber (contrairement à compute_backend).
             self._transcriber.language     = None if new_config.get("language") == "auto" else new_config.get("language", "fr")
             self._transcriber.reformatting = new_config.get("reformatting", True)
             self._transcriber.update_model(new_config.get("model", "small"))
             self._apply_beam_size(new_config.get("beam_size", 1))
+            self._apply_ai_reformat(new_config.get("ai_reformat", False))
 
         # NB : input_device n'exige aucune action ici — il est stocké dans
         # self.config et lu au prochain enregistrement (_on_fn_press).

@@ -171,7 +171,8 @@ def select_backend(requested: str, *, is_darwin: bool, is_arm64: bool,
 class Transcriber:
     def __init__(self, model: str = "small", language: str = "fr",
                  reformatting: bool = True, beam_size: int = 1,
-                 backend: str = "auto", postprocess: bool = True):
+                 backend: str = "auto", postprocess: bool = True,
+                 ai_reformat: bool = False):
         self.model_name   = model
         self.language     = None if language == "auto" else language
         self.reformatting = reformatting
@@ -181,6 +182,10 @@ class Transcriber:
         # dictionnaire perso + correction des termes + expansion des snippets.
         # Activé par défaut ; se désactive pour retrouver le comportement brut.
         self.postprocess  = postprocess
+        # Reformatage par IA (LLM local) : quand actif ET disponible, il REMPLACE
+        # le nettoyage par règles ; sinon repli automatique sur les règles.
+        # Ajouté en dernier param → n'invalide aucun appel existant.
+        self.ai_reformat  = ai_reformat
         self._model       = None
         self._model_lock  = threading.Lock()
 
@@ -228,8 +233,10 @@ class Transcriber:
 
     def update_settings(self, beam_size: int | None = None,
                         language: str | None = None,
-                        reformatting: bool | None = None):
-        """Met à jour à chaud beam_size / language / reformatting (thread-safe).
+                        reformatting: bool | None = None,
+                        ai_reformat: bool | None = None):
+        """Met à jour à chaud beam_size / language / reformatting / ai_reformat
+        (thread-safe).
 
         Les paramètres laissés à None ne sont pas modifiés. Ne recharge PAS le
         modèle (contrairement à update_model) : ces réglages sont lus à chaque
@@ -242,6 +249,8 @@ class Transcriber:
                 self.language = None if language == "auto" else language
             if reformatting is not None:
                 self.reformatting = reformatting
+            if ai_reformat is not None:
+                self.ai_reformat = ai_reformat
 
     def preload(self):
         """Charge le modèle ET fait un warmup (transcrit ~0.5 s de silence) pour
@@ -306,8 +315,10 @@ class Transcriber:
         text = " ".join(textes).strip()
 
         detected_lang = detected_lang if self.language is None else self.language
-        if self.reformatting:
-            text = self._reformat(text, detected_lang)
+        # Aiguillage du reformatage : IA locale (LLM) si active et disponible,
+        # sinon règles ; texte brut si le reformatage est désactivé. Le
+        # post-traitement dico+snippets ci-dessous s'applique quel que soit le mode.
+        text = self._reformat_text(text, detected_lang)
 
         # Post-traitement « intelligence locale », EN AVAL du reformatage et
         # uniquement si activé : correction des termes du dico puis expansion des
@@ -419,6 +430,51 @@ class Transcriber:
         return raw, result.get("language", self.language)
 
     # ── Reformatage ───────────────────────────────────────────────────────────
+
+    def _llm_ready(self) -> bool:
+        """True si le module LLM local est présent, disponible ET son modèle prêt.
+
+        Import différé + défensif : module absent (agent parallèle non encore
+        livré) ou toute erreur → False. L'IA est alors traitée comme indisponible
+        et le reformatage retombe sur les règles.
+        """
+        try:
+            from core import llm
+            return bool(llm.is_available()) and bool(llm.is_model_ready())
+        except Exception as e:  # pragma: no cover - purement défensif
+            logger.debug("Module LLM indisponible: %s", e)
+            return False
+
+    def _reformat_text(self, text: str, lang: str) -> str:
+        """Aiguille le reformatage entre IA locale (LLM) et règles, avec repli.
+
+        - `self.reformatting` False → texte brut inchangé (comportement d'origine :
+          les règles n'étaient appelées que si reformatting était actif).
+        - `self.ai_reformat` actif ET LLM disponible ET modèle prêt → tente le
+          reformatage LLM ; si le LLM renvoie une chaîne NON vide → on l'utilise
+          (règles NON appliquées) ; sinon (None, chaîne vide, exception) → repli
+          AUTOMATIQUE sur le reformatage par règles (`_reformat`).
+        - sinon → reformatage par règles (`_reformat`, comportement d'origine).
+
+        Le post-traitement dictionnaire + snippets (`_apply_postprocessing`)
+        s'applique EN AVAL, quel que soit le mode retenu ici (géré par transcribe()).
+        """
+        if not self.reformatting:
+            return text
+
+        if self.ai_reformat and self._llm_ready():
+            try:
+                from core import llm
+                out = llm.reformat(text, language=lang)
+            except Exception as e:  # pragma: no cover - purement défensif
+                logger.debug("Reformatage IA a levé → repli sur les règles: %s", e)
+                out = None
+            if isinstance(out, str) and out.strip():
+                return out
+            logger.debug("Reformatage IA indisponible/vide → repli sur les règles.")
+            return self._reformat(text, lang)
+
+        return self._reformat(text, lang)
 
     def _reformat(self, text: str, lang: str) -> str:
         if not text:

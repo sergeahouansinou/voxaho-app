@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QButtonGroup, QRadioButton, QSlider, QFrame,
     QSpacerItem, QSizePolicy, QMessageBox, QProgressDialog,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QEventLoop
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QEventLoop, QThread
 from PyQt6.QtGui import QFont, QColor
 
 # Version centralisée : core/__init__.py est la source unique de vérité.
@@ -130,6 +130,71 @@ def _model_is_cached(model_name: str) -> bool:
         f"models--Systran--faster-whisper-{model_name}",
     )
     return os.path.isdir(cache_dir)
+
+
+def _import_llm():
+    """Import différé et défensif du module de reformatage IA (core.llm).
+
+    Le composant IA est fourni par un agent parallèle et peut être ABSENT de
+    cette installation. On renvoie le module seulement s'il expose l'API du
+    contrat (is_available / is_model_ready / download_model), sinon None —
+    l'appelant traite alors le composant comme indisponible.
+    """
+    try:
+        from core import llm
+    except Exception:
+        return None
+    if not all(hasattr(llm, attr)
+               for attr in ("is_available", "is_model_ready", "download_model")):
+        return None
+    return llm
+
+
+def ai_status_label(available: bool, ready: bool) -> str:
+    """Libellé d'état du composant de reformatage IA local (fonction pure).
+
+    Testable sans Qt. Trois branches :
+      - composant absent              → « Composant IA non installé »
+      - présent mais modèle manquant  → « Modèle IA non téléchargé »
+      - présent et prêt               → « ✓ Modèle IA prêt »
+    """
+    if not available:
+        return "Composant IA non installé"
+    if not ready:
+        return "Modèle IA non téléchargé"
+    return "✓ Modèle IA prêt"
+
+
+# ── Worker de téléchargement du modèle IA (~1 Go) ────────────────────────────────
+class _AiModelDownloader(QThread):
+    """Télécharge le modèle IA local via core.llm.download_model, hors GUI.
+
+    Même pattern que ModelDownloader / _ActivationWorker (setup_wizard) :
+    signaux success/error remontés au thread GUI (queued connection), pas de
+    parent (survit à la destruction du dialog, référence anti-GC gardée par
+    SettingsWindow via _park_thread). L'import de core.llm est fait dans run()
+    et reste défensif.
+    """
+
+    success = pyqtSignal()
+    error   = pyqtSignal(str)
+
+    def run(self):
+        try:
+            from core import llm
+        except Exception as e:  # composant IA absent de cette installation
+            self.error.emit(f"Composant IA indisponible : {e}")
+            return
+        try:
+            ok = llm.download_model(progress_cb=None)
+        except Exception as e:
+            logger.error(f"_AiModelDownloader: {e}", exc_info=True)
+            self.error.emit(str(e))
+            return
+        if ok:
+            self.success.emit()
+        else:
+            self.error.emit("Le téléchargement du modèle IA a échoué.")
 
 
 # ── Stylesheet global ───────────────────────────────────────────────────────────
@@ -286,6 +351,10 @@ class SettingsWindow(QDialog):
         self._dl_loop: QEventLoop | None = None
         self._dl_status: str | None = None
         self._dl_error = ""
+        self._ai_dl_worker = None   # worker de téléchargement modèle IA (anti-GC)
+        self._ai_dl_loop: QEventLoop | None = None
+        self._ai_dl_status: str | None = None
+        self._ai_dl_error = ""
 
         self._setup_ui()
         self._load_values()
@@ -396,6 +465,33 @@ class SettingsWindow(QDialog):
         hint.setWordWrap(True)
         lay.addWidget(hint)
 
+        # ── Reformatage IA (local) — vrai LLM local, option distincte ────────
+        lay.addSpacing(12)
+        lay.addWidget(self._section_label("Reformatage IA (local)"))
+        self.ck_ai_reformat = QCheckBox("  Reformatage par IA locale (Qwen 2.5)")
+        self.ck_ai_reformat.stateChanged.connect(self._on_ai_reformat_toggle)
+        lay.addWidget(self.ck_ai_reformat)
+        ai_hint = QLabel(
+            "Reformule intelligemment votre dictée — 100 % local, hors-ligne. "
+            "Nécessite un modèle de ~1 Go.",
+            objectName="desc",
+        )
+        ai_hint.setWordWrap(True)
+        lay.addWidget(ai_hint)
+
+        # Zone d'état + action, mise à jour dynamiquement par _refresh_ai_status().
+        ai_row = QHBoxLayout()
+        ai_row.setSpacing(10)
+        self.lb_ai_status = QLabel("", objectName="hint")
+        self.lb_ai_status.setWordWrap(True)
+        self.btn_ai_download = QPushButton("Télécharger le modèle (~1 Go)")
+        self.btn_ai_download.clicked.connect(self._download_ai_model)
+        ai_row.addWidget(self.lb_ai_status, 1)
+        ai_row.addWidget(self.btn_ai_download)
+        lay.addLayout(ai_row)
+        # État initial (indispo / à télécharger / prêt) dès la construction.
+        self._refresh_ai_status()
+
         lay.addSpacing(12)
         lay.addWidget(self._section_label("Démarrage automatique"))
         self.ck_autostart = QCheckBox("  Lancer Voxaho à l'ouverture de session")
@@ -414,6 +510,159 @@ class SettingsWindow(QDialog):
 
         lay.addStretch(1)
         return w
+
+    # ── Reformatage IA (local) : état + téléchargement ───────────────────────
+    def _refresh_ai_status(self):
+        """Rafraîchit l'état du composant IA sous la case « Reformatage IA ».
+
+        Trois états (cf. ai_status_label) :
+          - indisponible → label gris, case décochée + désactivée, bouton masqué ;
+          - dispo mais modèle absent → label orangé + bouton « Télécharger » ;
+          - dispo + prêt → label vert « ✓ Modèle IA prêt », bouton masqué.
+        Défensif : core.llm peut être absent (agent parallèle). Appelée à la
+        construction de l'onglet et après un téléchargement.
+        """
+        llm = _import_llm()
+        available = bool(llm and llm.is_available())
+        ready = bool(available and llm.is_model_ready())
+
+        self.lb_ai_status.setText(ai_status_label(available, ready))
+
+        if not available:
+            # Composant IA non installé : on neutralise la case (décochée).
+            self.lb_ai_status.setStyleSheet("color: #636366;")
+            self.btn_ai_download.hide()
+            self.ck_ai_reformat.blockSignals(True)
+            self.ck_ai_reformat.setChecked(False)
+            self.ck_ai_reformat.blockSignals(False)
+            self.ck_ai_reformat.setEnabled(False)
+        elif not ready:
+            self.lb_ai_status.setStyleSheet("color: #FF9F0A;")
+            self.btn_ai_download.show()
+            self.btn_ai_download.setEnabled(True)
+            self.ck_ai_reformat.setEnabled(True)
+        else:
+            self.lb_ai_status.setStyleSheet("color: #30D158; font-weight: 600;")
+            self.btn_ai_download.hide()
+            self.ck_ai_reformat.setEnabled(True)
+
+    def _on_ai_reformat_toggle(self, *_):
+        """Coche/décoche « Reformatage par IA locale ».
+
+        Si l'utilisateur active alors que le modèle n'est pas prêt, on propose
+        de le télécharger (non bloquant : le transcriber retombe sur les règles
+        tant que le modèle est absent). Respecte le gate self._building.
+        """
+        if self._building:
+            return
+        if self.ck_ai_reformat.isChecked():
+            llm = _import_llm()
+            if llm and llm.is_available() and not llm.is_model_ready():
+                resp = QMessageBox.question(
+                    self, "Modèle IA requis",
+                    "Le reformatage par IA nécessite un modèle (~1 Go) qui "
+                    "n'est pas encore téléchargé.\n\nLe télécharger maintenant ?",
+                )
+                if resp == QMessageBox.StandardButton.Yes:
+                    self._download_ai_model()
+        self._emit_preview()
+
+    def _download_ai_model(self):
+        """Télécharge le modèle IA (~1 Go) dans un QThread, sans geler l'UI.
+
+        QProgressDialog indéterminé + worker _AiModelDownloader (signaux
+        success/error sur le thread GUI). On attend via une boucle
+        d'événements locale — l'UI reste réactive. Référence anti-GC gardée
+        (_park_thread) et signaux déconnectés en sortie. Succès → refresh +
+        message ; échec → warning ; annulation → refresh silencieux.
+        """
+        llm = _import_llm()
+        if not (llm and llm.is_available()):
+            QMessageBox.warning(
+                self, "Reformatage IA",
+                "Le composant IA n'est pas disponible sur cette installation.",
+            )
+            return
+        if self._ai_dl_worker is not None and self._ai_dl_worker.isRunning():
+            return  # téléchargement déjà en cours
+
+        # Import différé : évite un import circulaire au niveau module
+        # (setup_wizard importe LANGS depuis ce module).
+        from ui.setup_wizard import _park_thread
+
+        dlg = QProgressDialog(
+            "Téléchargement du modèle IA…\n"
+            "~1 Go, cela peut prendre plusieurs minutes.",
+            "Annuler", 0, 0, self,  # min == max == 0 → barre indéterminée
+        )
+        dlg.setWindowTitle("Voxaho — Téléchargement IA")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+
+        self._ai_dl_status = None
+        self._ai_dl_error = ""
+        self._ai_dl_loop = QEventLoop(self)
+
+        worker = _AiModelDownloader()
+        self._ai_dl_worker = worker      # référence anti-GC
+        _park_thread(worker)
+        worker.success.connect(self._on_ai_dl_success)
+        worker.error.connect(self._on_ai_dl_error)
+        dlg.canceled.connect(self._on_ai_dl_canceled)
+        worker.start()
+        dlg.show()
+        self._ai_dl_loop.exec()
+        self._ai_dl_loop = None
+
+        # Déconnexions : un signal tardif (worker abandonné après annulation)
+        # ne doit pas rejouer les slots plus tard.
+        for sig in (worker.success, worker.error):
+            try:
+                sig.disconnect()
+            except TypeError:
+                pass
+        try:
+            dlg.canceled.disconnect(self._on_ai_dl_canceled)
+        except TypeError:
+            pass
+        dlg.close()
+        dlg.deleteLater()
+
+        if self._ai_dl_status == "ok":
+            self._refresh_ai_status()
+            QMessageBox.information(
+                self, "Reformatage IA",
+                "✓ Modèle IA téléchargé. Le reformatage par IA est prêt.",
+            )
+        elif self._ai_dl_status == "error":
+            QMessageBox.warning(
+                self, "Téléchargement échoué",
+                f"Impossible de télécharger le modèle IA :\n{self._ai_dl_error}",
+            )
+            self._refresh_ai_status()
+        else:
+            # "cancel" : le run() est bloquant et non interruptible — le thread
+            # reste garé dans _orphan_threads et mourra avec le process.
+            self._refresh_ai_status()
+
+    def _end_ai_download_wait(self, status: str, msg: str = ""):
+        # Slot exécuté sur le thread GUI (queued connection).
+        if self._ai_dl_status is None:
+            self._ai_dl_status = status
+            self._ai_dl_error = msg
+        if self._ai_dl_loop is not None:
+            self._ai_dl_loop.quit()
+
+    def _on_ai_dl_success(self):
+        self._end_ai_download_wait("ok")
+
+    def _on_ai_dl_error(self, msg: str):
+        self._end_ai_download_wait("error", msg)
+
+    def _on_ai_dl_canceled(self):
+        self._end_ai_download_wait("cancel")
 
     # ── Onglet 2 : Modèle ────────────────────────────────────────────────────
     def _build_model_tab(self) -> QWidget:
@@ -857,8 +1106,14 @@ class SettingsWindow(QDialog):
         idx = next((i for i, (c, _) in enumerate(LANGS) if c == lang), 0)
         self.cb_lang.setCurrentIndex(idx)
 
-        # Reformatage
+        # Reformatage (par règles)
         self.ck_reformat.setChecked(bool(cfg.get("reformatting", True)))
+
+        # Reformatage IA (local) — défaut False si absent. On réaligne ensuite
+        # l'état visuel : si le composant est indisponible, _refresh_ai_status
+        # re-décoche et désactive la case (cohérence avec la dispo réelle).
+        self.ck_ai_reformat.setChecked(bool(cfg.get("ai_reformat", False)))
+        self._refresh_ai_status()
 
         # Modèle
         model = cfg.get("model", "small")
@@ -918,6 +1173,7 @@ class SettingsWindow(QDialog):
         cfg = deepcopy(self.config)
         cfg["language"]     = self.cb_lang.currentData()
         cfg["reformatting"] = self.ck_reformat.isChecked()
+        cfg["ai_reformat"]  = self.ck_ai_reformat.isChecked()
         cfg["model"]        = self.cb_model.currentData()
         if not IS_MAC:
             cfg["win_key"]  = self.cb_winkey.currentData()

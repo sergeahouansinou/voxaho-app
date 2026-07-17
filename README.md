@@ -12,16 +12,30 @@ Contrairement aux solutions concurrentes basées sur le cloud, **Voxaho fonction
 
 ## ✨ Fonctionnalités
 
+**Dictée**
 - **Dictée universelle** : fonctionne dans toutes vos applications (Mail, Word, Slack, VS Code, navigateur…)
 - **Push-to-talk** : maintenez `Fn` (macOS) ou `Ctrl droit` (Windows, configurable) pendant que vous parlez
-- **Transcription locale** propulsée par [Whisper](https://github.com/openai/whisper) via `faster-whisper` — 4 modèles au choix (tiny → large-v3) selon votre machine
-- **6 langues de dictée** : français, anglais, espagnol, allemand, italien + détection automatique
-- **Nettoyage automatique** : suppression des hésitations (« euh », « um »…), ponctuation, majuscules, filtre anti-hallucinations
+- **Transcription locale rapide** propulsée par [Whisper](https://github.com/openai/whisper) via `faster-whisper` — modèles tiny → `large-v3-turbo`, préchargement au démarrage (1ʳᵉ dictée sans attente), accélération **Metal/MLX** optionnelle sur Apple Silicon
+- **~38 langues de dictée** + détection automatique
+- **Choix du microphone** et réglage **Vitesse / Qualité**
 - **Préservation du presse-papiers** : votre copier-coller en cours n'est jamais perdu
+
+**Intelligence (100 % locale)**
+- **Reformatage par IA locale** (opt-in) : un LLM local (**Qwen 2.5**, ~1 Go) reformule et met en forme votre dictée — hors-ligne, désactivable, avec repli automatique sur le nettoyage par règles
+- **Nettoyage par règles** : suppression des hésitations (« euh », « um »…), ponctuation, majuscules (Unicode), filtre anti-hallucinations Whisper
+- **Dictionnaire personnel** : vos termes/noms propres/jargon, mieux reconnus et corrigés automatiquement
+- **Snippets vocaux** : un déclencheur parlé → un texte complet inséré
+
+**Espace de travail (Workspace)**
+- **Fenêtre principale à sidebar** : Accueil, Historique, Notes, Statistiques
+- **Historique des dictées** : recherche, favoris, copier — stocké localement (SQLite)
+- **Notes vocales** (scratchpad) et **statistiques** (mots dictés, temps économisé, activité)
+
+**Confort**
 - **Barre flottante discrète** : indicateur d'état animé, personnalisable (position, couleur, taille)
 - **Assistant de configuration** : onboarding guidé — permissions, choix du modèle, test micro, tutoriel
 - **Démarrage automatique** à l'ouverture de session (optionnel)
-- **Hors-ligne** : après le téléchargement initial du modèle, aucune connexion n'est nécessaire
+- **Hors-ligne** : après le téléchargement initial des modèles, aucune connexion n'est nécessaire
 
 ## 💼 Modèle de licence
 
@@ -36,21 +50,29 @@ Contrairement aux solutions concurrentes basées sur le cloud, **Voxaho fonction
 localflow/
 ├── main.py               # Point d'entrée, config, gate licence/trial
 ├── core/
-│   ├── recorder.py       # Capture micro (sounddevice, 16 kHz mono)
-│   ├── transcriber.py    # Transcription faster-whisper + reformatage
-│   ├── injector.py       # Injection du texte (presse-papiers + collage)
+│   ├── recorder.py       # Capture micro (sounddevice, 16 kHz mono, choix du device)
+│   ├── transcriber.py    # Transcription faster-whisper/MLX + reformatage (règles/IA)
+│   ├── llm.py            # LLM local (Qwen 2.5 via llama.cpp) — reformatage IA
+│   ├── injector.py       # Injection du texte (presse-papiers + collage + restauration)
 │   ├── hotkey.py         # Touche globale (CGEventTap macOS / pynput Windows)
 │   ├── license.py        # Licence Lemon Squeezy + trial 14 j signé HMAC
+│   ├── db.py             # Base SQLite locale (~/.voxaho/voxaho.db, WAL)
+│   ├── history.py        # Historique des dictées
+│   ├── notes.py          # Notes vocales
+│   ├── stats.py          # Statistiques d'usage
+│   ├── dictionary.py     # Dictionnaire personnel (termes + correction fuzzy)
+│   ├── snippets.py       # Snippets vocaux (déclencheur → expansion)
 │   ├── autostart.py      # Lancement à la session (LaunchAgent / registre)
 │   └── relaunch.py       # Redémarrage après octroi de permissions
 ├── ui/
 │   ├── floating_bar.py   # Barre flottante animée (états visuels)
-│   ├── settings_window.py# Préférences (6 onglets)
-│   └── setup_wizard.py   # Assistant premier lancement (7 étapes)
-└── tests/                # Suite pytest (82 tests)
+│   ├── workspace_window.py # Fenêtre principale à sidebar (Accueil/Historique/Notes/Stats)
+│   ├── settings_window.py# Préférences (onglets)
+│   └── setup_wizard.py   # Assistant premier lancement
+└── tests/                # Suite pytest (300+ tests)
 ```
 
-**Pipeline de dictée** : touche pressée → enregistrement → touche relâchée → transcription Whisper → nettoyage → injection dans l'app active.
+**Pipeline de dictée** : touche pressée → enregistrement → touche relâchée → transcription Whisper → reformatage (IA locale ou règles) → dictionnaire + snippets → injection dans l'app active → enregistrement dans l'historique local.
 
 ## 🛠 Développement
 

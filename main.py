@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
     "input_device":    None,       # index micro (None = périphérique système par défaut)
     "beam_size":       1,          # faster-whisper beam search (1 = greedy, le plus rapide)
     "compute_backend": "auto",     # "auto" | "cpu" | "mlx" (fixé au constructeur du Transcriber)
+    "ai_reformat":     False,      # reformatage IA local via LLM (retombe sur les règles si LLM absent)
 }
 
 
