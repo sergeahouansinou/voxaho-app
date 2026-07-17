@@ -325,12 +325,17 @@ class FloatingBar(QWidget):
         self._launch_preload()
 
     def _build_transcriber(self):
-        """Instancie un Transcriber avec la config courante (beam_size + backend + ai_reformat).
+        """Instancie un Transcriber avec la config courante (beam_size + backend
+        + ai_reformat + translate_to).
 
-        Défensif : si le constructeur de l'agent moteur ne connaît pas encore les
-        kwargs `beam_size`/`backend`/`ai_reformat` (ordre d'arrivée des agents
-        parallèles), on retombe sur la signature minimale. Transitoire — à retirer
-        une fois le contrat moteur stabilisé.
+        Défensif, par repli progressif : si le constructeur de l'agent moteur ne
+        connaît pas encore certains kwargs récents (ordre d'arrivée des agents
+        parallèles), on retombe d'un cran à la fois plutôt que de perdre d'un coup
+        tous les réglages récents :
+          1. tout (dont translate_to, le plus récent) ;
+          2. sans translate_to (moteur pas encore doté de la traduction) ;
+          3. signature minimale (contrat moteur historique).
+        Transitoire — à retirer une fois le contrat moteur stabilisé.
         """
         from core.transcriber import Transcriber
         model        = self.config.get("model",           "small")
@@ -339,6 +344,19 @@ class FloatingBar(QWidget):
         beam_size    = self.config.get("beam_size",       1)
         backend      = self.config.get("compute_backend", "auto")
         ai_reformat  = self.config.get("ai_reformat",     False)
+        translate_to = self.config.get("translate_to",    None)
+        try:
+            return Transcriber(
+                model        = model,
+                language     = language,
+                reformatting = reformatting,
+                beam_size    = beam_size,
+                backend      = backend,
+                ai_reformat  = ai_reformat,
+                translate_to = translate_to,
+            )
+        except TypeError:
+            pass  # transitoire : moteur pas encore doté du kwarg translate_to
         try:
             return Transcriber(
                 model        = model,
@@ -350,7 +368,7 @@ class FloatingBar(QWidget):
             )
         except TypeError:
             # Transitoire : constructeur moteur pas encore à jour → sans kwargs.
-            logger.warning("Transcriber sans kwargs beam_size/backend/ai_reformat (contrat moteur transitoire)")
+            logger.warning("Transcriber sans kwargs beam_size/backend/ai_reformat/translate_to (contrat moteur transitoire)")
             return Transcriber(
                 model        = model,
                 language     = language,
@@ -399,6 +417,29 @@ class FloatingBar(QWidget):
             self._transcriber.ai_reformat = ai_reformat
         except Exception as e:
             logger.warning(f"_apply_ai_reformat: {e}")
+
+    def _apply_translate_to(self, translate_to):
+        """Applique translate_to à chaud : via update_settings si dispo, sinon setattr.
+
+        Comme ai_reformat, la langue cible de traduction est lue à l'exécution de
+        transcribe() : nul besoin de recréer le Transcriber, un simple réglage à
+        chaud suffit. On passe TOUJOURS une valeur explicite (None = traduction
+        désactivée, ou un code langue) : c'est la sentinelle interne du moteur qui
+        distingue « ne pas toucher » de « None ». Défensif : le moteur peut ne pas
+        encore connaître le kwarg translate_to (agents parallèles) → repli setattr.
+        """
+        update = getattr(self._transcriber, "update_settings", None)
+        if callable(update):
+            try:
+                update(translate_to=translate_to)
+                return
+            except TypeError:
+                pass  # transitoire : update_settings sans kwarg translate_to
+        # Repli : attribut direct (le moteur expose self.translate_to)
+        try:
+            self._transcriber.translate_to = translate_to
+        except Exception as e:
+            logger.warning(f"_apply_translate_to: {e}")
 
     def _recreate_transcriber(self):
         """Recrée le Transcriber (backend changé) : unload → new → preload.
@@ -1079,6 +1120,11 @@ class FloatingBar(QWidget):
             self._transcriber.update_model(new_config.get("model", "small"))
             self._apply_beam_size(new_config.get("beam_size", 1))
             self._apply_ai_reformat(new_config.get("ai_reformat", False))
+            # Traduction à la volée : lue à l'exécution de transcribe(), donc
+            # applicable à chaud (comme ai_reformat). Le cas backend changé passe
+            # par _recreate_transcriber → _build_transcriber, qui repasse déjà
+            # translate_to au constructeur : rien à faire dans cette branche-là.
+            self._apply_translate_to(new_config.get("translate_to"))
 
         # NB : input_device n'exige aucune action ici — il est stocké dans
         # self.config et lu au prochain enregistrement (_on_fn_press).

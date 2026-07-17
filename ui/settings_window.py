@@ -150,6 +150,22 @@ def _import_llm():
     return llm
 
 
+def _translator_available() -> bool:
+    """Vrai si le module de traduction à la volée est présent ET disponible.
+
+    Import différé + défensif : core.translator est fourni par un agent
+    parallèle et peut être ABSENT de cette installation. Toute erreur (module
+    introuvable, is_available manquant, exception à l'appel) → False : la
+    traduction est alors considérée comme indisponible et l'UI affiche la note
+    invitant à activer d'abord le reformatage IA (qui télécharge le modèle).
+    """
+    try:
+        from core import translator
+        return bool(translator.is_available())
+    except Exception:
+        return False
+
+
 def ai_status_label(available: bool, ready: bool) -> str:
     """Libellé d'état du composant de reformatage IA local (fonction pure).
 
@@ -491,6 +507,42 @@ class SettingsWindow(QDialog):
         lay.addLayout(ai_row)
         # État initial (indispo / à télécharger / prêt) dès la construction.
         self._refresh_ai_status()
+
+        # ── Traduction à la volée ────────────────────────────────────────────
+        lay.addSpacing(12)
+        lay.addWidget(self._section_label("Traduction"))
+        tr_lbl = QLabel("Traduire la dictée vers…", objectName="desc")
+        lay.addWidget(tr_lbl)
+        self.cb_translate = QComboBox()
+        # 1ʳᵉ entrée = désactivé (aucune traduction) → valeur None (currentData).
+        self.cb_translate.addItem("Désactivé (garder la langue dictée)", None)
+        # Puis toutes les langues de LANGS SAUF « auto » : on traduit vers une
+        # langue PRÉCISE (une cible « automatique » n'aurait pas de sens).
+        for code, label in LANGS:
+            if code == "auto":
+                continue
+            self.cb_translate.addItem(label, code)
+        self.cb_translate.currentIndexChanged.connect(self._emit_preview)
+        lay.addWidget(self.cb_translate)
+
+        tr_hint = QLabel(
+            "Dictez dans n'importe quelle langue, Voxaho écrit dans celle "
+            "choisie. Nécessite le modèle IA (Qwen).",
+            objectName="desc",
+        )
+        tr_hint.setWordWrap(True)
+        lay.addWidget(tr_hint)
+
+        # Note défensive : si le composant de traduction est indisponible
+        # (core.translator absent ou modèle IA non prêt), on invite à activer
+        # d'abord le reformatage IA (qui déclenche le téléchargement du modèle).
+        if not _translator_available():
+            tr_note = QLabel(
+                "Active d'abord le reformatage IA (télécharge le modèle).",
+                objectName="hint",
+            )
+            tr_note.setWordWrap(True)
+            lay.addWidget(tr_note)
 
         lay.addSpacing(12)
         lay.addWidget(self._section_label("Démarrage automatique"))
@@ -1115,6 +1167,15 @@ class SettingsWindow(QDialog):
         self.ck_ai_reformat.setChecked(bool(cfg.get("ai_reformat", False)))
         self._refresh_ai_status()
 
+        # Traduction : code langue cible (None = désactivé, défaut). Index 0 =
+        # entrée « Désactivé » (currentData None) ; sinon on retrouve le code.
+        translate_to = cfg.get("translate_to", None)
+        if translate_to is None:
+            self.cb_translate.setCurrentIndex(0)
+        else:
+            pos = self.cb_translate.findData(translate_to)
+            self.cb_translate.setCurrentIndex(pos if pos >= 0 else 0)
+
         # Modèle
         model = cfg.get("model", "small")
         idx = next((i for i, (c, _, _) in enumerate(MODELS) if c == model), 1)
@@ -1174,6 +1235,8 @@ class SettingsWindow(QDialog):
         cfg["language"]     = self.cb_lang.currentData()
         cfg["reformatting"] = self.ck_reformat.isChecked()
         cfg["ai_reformat"]  = self.ck_ai_reformat.isChecked()
+        # Traduction : None (désactivé) ou code langue cible (currentData).
+        cfg["translate_to"] = self.cb_translate.currentData()
         cfg["model"]        = self.cb_model.currentData()
         if not IS_MAC:
             cfg["win_key"]  = self.cb_winkey.currentData()
