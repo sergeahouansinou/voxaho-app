@@ -35,8 +35,27 @@ logger = logging.getLogger(__name__)
 LS_API = "https://api.lemonsqueezy.com/v1/licenses"
 LICENSE_PATH = os.path.expanduser("~/.voxaho/license.json")
 TRIAL_PATH   = os.path.expanduser("~/.voxaho/trial.json")
-OFFLINE_GRACE_DAYS = 7   # tolère 7 jours sans connexion avant de re-valider
+OFFLINE_GRACE_DAYS = 7    # tolère 7 jours sans connexion avant de re-valider
+REVALIDATE_HOURS = 72     # re-vérifie la licence en ligne au-delà de cet âge
 TRIAL_DAYS = 14
+
+
+def _default_marker_path() -> str:
+    """Emplacement discret, dépendant de la plateforme, du marqueur trial redondant.
+
+    Le marqueur est une copie signée de trial.json stockée hors de ~/.voxaho :
+    supprimer ~/.voxaho/trial.json ne suffit donc plus à réinitialiser l'essai.
+    """
+    if platform.system() == "Darwin":
+        return os.path.expanduser("~/Library/Application Support/.voxaho_meta")
+    if platform.system() == "Windows":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return os.path.join(appdata, ".voxaho_meta")
+    return os.path.expanduser("~/.config/.voxaho_meta")
+
+
+TRIAL_MARKER_PATH = _default_marker_path()
 
 # Clé HMAC embarquée. Pas un secret cryptographique fort (binaire distribué),
 # mais suffisant pour détecter une édition naïve du fichier trial.json.
@@ -104,11 +123,25 @@ def activate(license_key: str) -> dict:
     return data
 
 
-def validate(*, allow_offline: bool = True) -> bool:
-    """Vérifie la licence stockée. Retourne True si valide."""
+# Issues possibles d'une vérification en ligne. On distingue soigneusement
+# le rejet EXPLICITE de Lemon Squeezy (clé révoquée, remboursée…) du simple
+# échec réseau : seul le premier est définitif, le second passe par la
+# grâce hors-ligne de OFFLINE_GRACE_DAYS jours.
+_OUTCOME_VALID    = "valid"
+_OUTCOME_INVALID  = "invalid"        # réponse LS explicite : {"valid": false}
+_OUTCOME_NETWORK  = "network_error"  # réseau KO / timeout → grâce offline
+_OUTCOME_NO_LIC   = "no_license"
+
+
+def _validate_remote() -> tuple[str, dict | None]:
+    """Interroge Lemon Squeezy et retourne (issue, licence stockée).
+
+    Rafraîchit last_check/status sur disque quand la réponse est valide.
+    Ne supprime jamais rien : la décision (grâce, purge) revient aux appelants.
+    """
     lic = _load()
     if not lic:
-        return False
+        return _OUTCOME_NO_LIC, None
 
     try:
         data = _post("validate", {
@@ -117,18 +150,67 @@ def validate(*, allow_offline: bool = True) -> bool:
         })
     except LicenseError as e:
         logger.warning(f"validate: réseau KO ({e}) — fallback offline")
-        if allow_offline:
-            return _offline_grace_ok(lic)
-        return False
+        return _OUTCOME_NETWORK, lic
 
     if data.get("valid"):
         lic["last_check"] = _now_iso()
         lic["status"]     = data.get("license_key", {}).get("status", "active")
         _save(lic)
-        return True
+        return _OUTCOME_VALID, lic
 
     logger.warning(f"Licence invalide : {data.get('error')}")
+    return _OUTCOME_INVALID, lic
+
+
+def validate(*, allow_offline: bool = True) -> bool:
+    """Vérifie la licence stockée. Retourne True si valide."""
+    outcome, lic = _validate_remote()
+    if outcome == _OUTCOME_VALID:
+        return True
+    if outcome == _OUTCOME_NETWORK:
+        return allow_offline and _offline_grace_ok(lic)
+    # _OUTCOME_NO_LIC ou _OUTCOME_INVALID (rejet explicite)
     return False
+
+
+def revalidate_if_due(max_age_hours: int = REVALIDATE_HOURS) -> bool:
+    """Re-vérifie la licence en ligne si la dernière vérification est trop vieille.
+
+    Pensée pour tourner en arrière-plan au démarrage (thread daemon) :
+    - Pas de licence stockée → rien à faire (le gate s'en charge) → True.
+    - last_check plus récent que max_age_hours → aucun appel réseau → True.
+    - Rejet EXPLICITE de Lemon Squeezy (clé révoquée/remboursée) → la licence
+      stockée est supprimée (_clear()) pour que le prochain lancement repasse
+      par le gate licence/trial → False.
+    - Échec réseau → grâce hors-ligne, la licence est CONSERVÉE.
+    Ne lève jamais : toute erreur inattendue est loguée et ignorée.
+    """
+    try:
+        lic = _load()
+        if not lic:
+            return True
+
+        last = lic.get("last_check")
+        if last:
+            try:
+                age_h = (datetime.now(timezone.utc)
+                         - datetime.fromisoformat(last)).total_seconds() / 3600
+                if age_h < max_age_hours:
+                    return True  # vérification récente → pas d'appel réseau
+            except ValueError:
+                pass  # last_check illisible → on re-valide par prudence
+
+        outcome, lic = _validate_remote()
+        if outcome == _OUTCOME_INVALID:
+            logger.warning("revalidate: rejet explicite Lemon Squeezy — purge de la licence")
+            _clear()
+            return False
+        if outcome == _OUTCOME_NETWORK:
+            return _offline_grace_ok(lic)  # licence conservée dans tous les cas
+        return True  # _OUTCOME_VALID ou _OUTCOME_NO_LIC (course bénigne)
+    except Exception as e:  # défensif : ne jamais faire planter le thread appelant
+        logger.warning(f"revalidate_if_due: erreur inattendue ({e})")
+        return True
 
 
 def deactivate() -> bool:
@@ -152,6 +234,21 @@ def is_activated() -> bool:
     return _load() is not None
 
 
+def masked_key() -> str | None:
+    """Clé de licence masquée pour affichage UI ("····-····-····-XXXX").
+
+    Retourne None s'il n'y a pas de licence stockée. Évite que l'UI accède
+    à la clé complète via l'API privée _load().
+    """
+    lic = _load()
+    if not lic:
+        return None
+    key = str(lic.get("key") or "")
+    if not key:
+        return None
+    return f"····-····-····-{key[-4:]}"
+
+
 # ── API publique trial ────────────────────────────────────────────────────────
 
 def has_trial() -> bool:
@@ -160,10 +257,26 @@ def has_trial() -> bool:
 
 
 def start_trial() -> dict:
-    """Démarre un trial de TRIAL_DAYS jours. Idempotent : ne réinitialise pas."""
+    """Démarre un trial de TRIAL_DAYS jours. Idempotent : ne réinitialise pas.
+
+    Anti-reset : avant d'accorder 14 jours neufs, on consulte le marqueur
+    redondant (TRIAL_MARKER_PATH). S'il est présent et signé correctement,
+    on restaure trial.json avec les MÊMES dates — supprimer ou corrompre
+    trial.json ne redonne donc pas un essai neuf. Si les DEUX emplacements
+    ont été supprimés, un nouveau trial démarre (limitation assumée : sans
+    serveur, aucune trace locale ne peut survivre à un effacement total).
+    """
     existing = _load_trial()
     if existing is not None:
         return existing
+
+    # trial.json absent ou altéré : le marqueur redondant fait foi s'il est valide.
+    marker = _read_signed(TRIAL_MARKER_PATH)
+    if marker is not None:
+        logger.debug("trial: restauration depuis le marqueur redondant (pas de reset)")
+        _save_trial(marker)
+        return marker
+
     now = _now_iso()
     payload = {"started_at": now, "last_seen": now}
     _save_trial(payload)
@@ -251,8 +364,53 @@ def _trial_sign(payload: dict) -> str:
     return hmac.new(_TRIAL_HMAC_KEY, msg, hashlib.sha256).hexdigest()
 
 
+def _read_signed(path: str) -> dict | None:
+    """Lit un fichier {payload, hmac} et vérifie la signature.
+
+    Retourne le payload, ou None si absent/illisible/altéré. Ne lève jamais.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            record = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    payload = record.get("payload")
+    sig = record.get("hmac")
+    if not isinstance(payload, dict) or not isinstance(sig, str):
+        return None
+    if not hmac.compare_digest(_trial_sign(payload), sig):
+        logger.warning(f"trial: HMAC invalide — {os.path.basename(path)} altéré")
+        return None
+    if "started_at" not in payload:
+        return None
+    return payload
+
+
+def _save_marker(payload: dict) -> None:
+    """Écrit le marqueur trial redondant. Silencieux : ne bloque jamais l'app."""
+    try:
+        marker_dir = os.path.dirname(TRIAL_MARKER_PATH)
+        if marker_dir:
+            os.makedirs(marker_dir, exist_ok=True)
+        record = {"payload": payload, "hmac": _trial_sign(payload)}
+        tmp = TRIAL_MARKER_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(record, f, separators=(",", ":"))
+        os.replace(tmp, TRIAL_MARKER_PATH)
+        try:
+            os.chmod(TRIAL_MARKER_PATH, 0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        logger.debug(f"trial: écriture du marqueur impossible ({e})")
+
+
 def _save_trial(payload: dict) -> None:
-    """Écrit ~/.voxaho/trial.json avec signature HMAC."""
+    """Écrit ~/.voxaho/trial.json signé HMAC + le marqueur redondant."""
     os.makedirs(os.path.dirname(TRIAL_PATH), exist_ok=True)
     record = {"payload": payload, "hmac": _trial_sign(payload)}
     tmp = TRIAL_PATH + ".tmp"
@@ -263,28 +421,37 @@ def _save_trial(payload: dict) -> None:
         os.chmod(TRIAL_PATH, 0o600)
     except OSError:
         pass
+    # Copie redondante hors ~/.voxaho : rend la suppression de trial.json inopérante.
+    _save_marker(payload)
 
 
 def _load_trial() -> dict | None:
-    """Lit et vérifie le HMAC. Retourne le payload, ou None si invalide/absent."""
-    if not os.path.exists(TRIAL_PATH):
-        return None
-    try:
-        with open(TRIAL_PATH) as f:
-            record = json.load(f)
-        payload = record.get("payload")
-        sig = record.get("hmac")
-        if not isinstance(payload, dict) or not isinstance(sig, str):
+    """Lit le trial signé, avec restauration croisée depuis le marqueur redondant.
+
+    - trial.json absent mais marqueur valide → restaure trial.json (mêmes dates).
+    - trial.json valide mais marqueur absent/altéré → recrée le marqueur.
+    - trial.json présent mais altéré → None (invalide, pas de restauration ici ;
+      start_trial() consultera le marqueur avant d'accorder un essai neuf).
+    """
+    if os.path.exists(TRIAL_PATH):
+        payload = _read_signed(TRIAL_PATH)
+        if payload is None:
             return None
-        expected = _trial_sign(payload)
-        if not hmac.compare_digest(expected, sig):
-            logger.warning("trial: HMAC invalide — fichier altéré")
-            return None
-        if "started_at" not in payload:
-            return None
+        # Symétrique : si le marqueur a disparu (ou est altéré), on le recrée.
+        if _read_signed(TRIAL_MARKER_PATH) is None:
+            _save_marker(payload)
         return payload
-    except (json.JSONDecodeError, IOError):
-        return None
+
+    # trial.json supprimé : restauration silencieuse depuis le marqueur.
+    marker = _read_signed(TRIAL_MARKER_PATH)
+    if marker is not None:
+        logger.debug("trial: trial.json absent — restauration depuis le marqueur")
+        try:
+            _save_trial(marker)  # réécrit trial.json avec les MÊMES dates
+        except OSError as e:
+            logger.warning(f"trial: restauration de trial.json impossible ({e})")
+        return marker
+    return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

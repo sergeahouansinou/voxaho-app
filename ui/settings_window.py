@@ -9,6 +9,7 @@ flottante. Émet :
 
 from __future__ import annotations
 
+import os
 import sys
 import logging
 import webbrowser
@@ -18,15 +19,17 @@ from PyQt6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QCheckBox, QLineEdit, QStackedWidget, QListWidget,
     QListWidgetItem, QButtonGroup, QRadioButton, QSlider, QFrame,
-    QSpacerItem, QSizePolicy, QMessageBox,
+    QSpacerItem, QSizePolicy, QMessageBox, QProgressDialog,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QEventLoop
 from PyQt6.QtGui import QFont, QColor
+
+# Version centralisée : core/__init__.py est la source unique de vérité.
+from core import __version__
 
 logger = logging.getLogger(__name__)
 
 IS_MAC = sys.platform == "darwin"
-APP_VERSION = "1.0.0"
 
 
 # ── Palette accent (id → (label, hex)) ──────────────────────────────────────────
@@ -63,6 +66,20 @@ WIN_KEYS = [
     ("shift_r",   "Shift droit"),
     ("caps_lock", "Verr. Maj."),
 ]
+
+
+def _model_is_cached(model_name: str) -> bool:
+    """Vrai si le modèle faster-whisper est déjà dans le cache HuggingFace.
+
+    Fonction pure (testable sans Qt) : vérifie l'existence du dossier
+    ~/.cache/huggingface/hub/models--Systran--faster-whisper-<model>
+    (mapping direct pour tiny/small/medium/large-v3).
+    """
+    cache_dir = os.path.join(
+        os.path.expanduser("~"), ".cache", "huggingface", "hub",
+        f"models--Systran--faster-whisper-{model_name}",
+    )
+    return os.path.isdir(cache_dir)
 
 
 # ── Stylesheet global ───────────────────────────────────────────────────────────
@@ -214,6 +231,11 @@ class SettingsWindow(QDialog):
         self.config = deepcopy(config)
         self._save_config = save_config_fn
         self._building = True  # gate les signaux pendant la construction
+        self._act_worker = None   # worker d'activation licence (anti-GC)
+        self._dl_worker = None    # worker de téléchargement modèle (anti-GC)
+        self._dl_loop: QEventLoop | None = None
+        self._dl_status: str | None = None
+        self._dl_error = ""
 
         self._setup_ui()
         self._load_values()
@@ -522,10 +544,10 @@ class SettingsWindow(QDialog):
         key_row = QHBoxLayout()
         self.ed_key = QLineEdit()
         self.ed_key.setPlaceholderText("XXXX-XXXX-XXXX-XXXX")
-        btn_activate = QPushButton("Activer")
-        btn_activate.clicked.connect(self._on_activate)
+        self.btn_activate = QPushButton("Activer")
+        self.btn_activate.clicked.connect(self._on_activate)
         key_row.addWidget(self.ed_key, 1)
-        key_row.addWidget(btn_activate)
+        key_row.addWidget(self.btn_activate)
         lay.addLayout(key_row)
 
         lay.addStretch(1)
@@ -568,14 +590,38 @@ class SettingsWindow(QDialog):
         key = self.ed_key.text().strip()
         if not key:
             return
-        try:
-            from core import license as lic
-            lic.activate(key)
-            QMessageBox.information(self, "Licence", "Activation réussie !")
-            self.ed_key.clear()
-            self._refresh_license_status()
-        except Exception as e:
-            QMessageBox.warning(self, "Activation échouée", str(e))
+        if self._act_worker is not None and self._act_worker.isRunning():
+            return  # activation déjà en cours
+        # Import différé : évite un import circulaire au niveau module
+        # (setup_wizard importe LANGS depuis ce module).
+        from ui.setup_wizard import _ActivationWorker, _park_thread
+        self.btn_activate.setEnabled(False)
+        self.btn_activate.setText("Activation…")
+        # Activation dans un worker (appel réseau ~10 s) : l'UI reste
+        # réactive. Le worker n'a pas de parent et est garé dans
+        # _orphan_threads : si la fenêtre est fermée pendant l'appel,
+        # Qt coupe les connexions et le thread meurt avec le process.
+        self._act_worker = _ActivationWorker(key)
+        _park_thread(self._act_worker)
+        self._act_worker.success.connect(self._on_activation_success)
+        self._act_worker.error.connect(self._on_activation_error)
+        self._act_worker.start()
+
+    def _reset_activate_btn(self):
+        self.btn_activate.setEnabled(True)
+        self.btn_activate.setText("Activer")
+
+    def _on_activation_success(self):
+        # Slot exécuté sur le thread GUI (queued connection).
+        self._reset_activate_btn()
+        QMessageBox.information(self, "Licence", "Activation réussie !")
+        self.ed_key.clear()
+        self._refresh_license_status()
+
+    def _on_activation_error(self, msg: str):
+        # Slot exécuté sur le thread GUI (queued connection).
+        self._reset_activate_btn()
+        QMessageBox.warning(self, "Activation échouée", msg)
 
     def _on_deactivate(self):
         ok = QMessageBox.question(
@@ -616,7 +662,7 @@ class SettingsWindow(QDialog):
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(title)
 
-        ver = QLabel(f"Version {APP_VERSION}", objectName="desc")
+        ver = QLabel(f"Version {__version__}", objectName="desc")
         ver.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(ver)
 
@@ -735,6 +781,21 @@ class SettingsWindow(QDialog):
 
     def _on_apply(self):
         cfg = self._collect()
+
+        # Nouveau modèle absent du cache local : téléchargement explicite
+        # AVANT d'appliquer — sinon il se téléchargeait silencieusement
+        # (jusqu'à 3 Go) à la première dictée et l'app semblait plantée.
+        old_model = self._original_config.get("model", "small")
+        new_model = cfg.get("model", old_model)
+        if new_model != old_model and not _model_is_cached(new_model):
+            if not self._download_model_with_progress(new_model):
+                # Annulation ou échec : on n'applique pas le changement de
+                # modèle (revert du combo) — le reste s'applique quand même.
+                cfg["model"] = old_model
+                idx = next((i for i, (c, _, _) in enumerate(MODELS)
+                            if c == old_model), 1)
+                self.cb_model.setCurrentIndex(idx)
+
         try:
             self._save_config(cfg)
         except Exception as e:
@@ -744,6 +805,89 @@ class SettingsWindow(QDialog):
         self._original_config = deepcopy(cfg)
         self.settings_applied.emit(cfg)
         self.accept()
+
+    # ── Téléchargement de modèle (depuis les Préférences) ────────────────────
+    def _download_model_with_progress(self, model: str) -> bool:
+        """Télécharge le modèle dans un QThread avec QProgressDialog.
+
+        Retourne True si le modèle est prêt, False si annulation ou erreur
+        (un QMessageBox.warning est alors affiché pour l'erreur). L'UI reste
+        réactive : on attend via une boucle d'événements locale, et les
+        signaux du worker arrivent sur le thread GUI (queued connection).
+        """
+        # Import différé : évite un import circulaire au niveau module
+        # (setup_wizard importe LANGS depuis ce module).
+        from ui.setup_wizard import ModelDownloader, _park_thread
+
+        dlg = QProgressDialog(
+            f"Téléchargement du modèle « {model} »…\n"
+            "Cela peut prendre plusieurs minutes.",
+            "Annuler", 0, 0, self,  # min == max == 0 → barre indéterminée
+        )
+        dlg.setWindowTitle("Voxaho — Téléchargement")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+
+        self._dl_status = None
+        self._dl_error = ""
+        self._dl_loop = QEventLoop(self)
+
+        worker = ModelDownloader(model)
+        self._dl_worker = worker      # référence anti-GC
+        _park_thread(worker)
+        worker.finished.connect(self._on_dl_finished)
+        worker.error.connect(self._on_dl_error)
+        dlg.canceled.connect(self._on_dl_canceled)
+        worker.start()
+        dlg.show()
+        self._dl_loop.exec()
+        self._dl_loop = None
+
+        # Déconnexions : évite qu'un signal tardif (worker abandonné après
+        # annulation, close du dialog) ne rejoue les slots plus tard.
+        for sig in (worker.finished, worker.error):
+            try:
+                sig.disconnect()
+            except TypeError:
+                pass
+        try:
+            dlg.canceled.disconnect(self._on_dl_canceled)
+        except TypeError:
+            pass
+        dlg.close()
+        dlg.deleteLater()
+
+        if self._dl_status == "ok":
+            return True
+        if self._dl_status == "error":
+            QMessageBox.warning(
+                self, "Téléchargement échoué",
+                f"Impossible de télécharger le modèle « {model} » :\n"
+                f"{self._dl_error}\n\nLe modèle actuel est conservé.",
+            )
+        # "cancel" : le thread ne peut pas être interrompu proprement
+        # (run() bloquant) — il reste garé dans _orphan_threads et mourra
+        # avec le process ; le modèle ne sera simplement pas appliqué.
+        return False
+
+    def _end_download_wait(self, status: str, msg: str = ""):
+        # Slot exécuté sur le thread GUI (queued connection).
+        if self._dl_status is None:
+            self._dl_status = status
+            self._dl_error = msg
+        if self._dl_loop is not None:
+            self._dl_loop.quit()
+
+    def _on_dl_finished(self):
+        self._end_download_wait("ok")
+
+    def _on_dl_error(self, msg: str):
+        self._end_download_wait("error", msg)
+
+    def _on_dl_canceled(self):
+        self._end_download_wait("cancel")
 
     def _on_cancel(self):
         # Restaurer config initiale en preview

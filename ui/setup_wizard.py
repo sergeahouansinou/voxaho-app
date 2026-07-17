@@ -30,6 +30,28 @@ IS_MAC = sys.platform == "darwin"
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
 LOGO_PATH = os.path.join(ASSETS_DIR, "voxaho-icon.svg")
 
+# Langues proposées : mêmes entrées (drapeaux/labels) que les Préférences —
+# settings_window.LANGS est la source unique (l'import est sûr :
+# settings_window n'importe pas ce module au niveau module).
+from ui.settings_window import LANGS
+
+# Threads volontairement détachés (fermeture d'un dialog pendant un
+# téléchargement ou une activation) : on garde une référence module-level
+# pour éviter le GC du wrapper Python ("QThread: Destroyed while thread is
+# still running" → crash). Ces threads mourront avec le process.
+_orphan_threads: list[QThread] = []
+
+
+def _park_thread(thread: QThread) -> None:
+    """Retient une référence module-level sur un QThread (anti-GC).
+
+    Purge au passage les threads déjà terminés pour éviter que la liste
+    ne grossisse indéfiniment.
+    """
+    _orphan_threads[:] = [t for t in _orphan_threads
+                          if t is not thread and t.isRunning()]
+    _orphan_threads.append(thread)
+
 STYLESHEET = """
 QDialog { background-color: #1C1C1E; }
 QWidget#page { background-color: #1C1C1E; }
@@ -215,6 +237,43 @@ class ModelDownloader(QThread):
             self.error.emit(str(e))
 
 
+# ─── Activation de licence en arrière-plan ────────────────────────────────────
+
+class _ActivationWorker(QThread):
+    """Exécute core.license.activate(key) hors du thread GUI.
+
+    L'activation fait un appel réseau urllib (timeout 10 s) qui gelait
+    l'interface. Le résultat remonte par signaux : l'émission est
+    thread-safe et Qt replanifie les slots sur le thread du receveur
+    (queued connection). Si le dialog receveur est détruit pendant
+    l'appel, Qt coupe les connexions — le worker ne crashe pas ; il
+    suffit de le garder référencé via _park_thread().
+
+    Réutilisé par SettingsWindow (ui/settings_window.py, import différé).
+    """
+
+    success = pyqtSignal()
+    error   = pyqtSignal(str)
+
+    def __init__(self, key: str, parent=None):
+        # parent=None par défaut : le worker doit survivre à la destruction
+        # du dialog appelant (référence anti-GC via _park_thread).
+        super().__init__(parent)
+        self._key = key
+
+    def run(self):
+        from core import license as license_mod
+        try:
+            license_mod.activate(self._key)
+        except license_mod.LicenseError as e:
+            self.error.emit(str(e))
+        except Exception as e:
+            logger.error(f"_ActivationWorker: {e}", exc_info=True)
+            self.error.emit(f"Erreur inattendue : {e}")
+        else:
+            self.success.emit()
+
+
 # ─── Wizard ───────────────────────────────────────────────────────────────────
 
 class SetupWizard(QDialog):
@@ -224,6 +283,10 @@ class SetupWizard(QDialog):
            4 Mic test, 5 Tutorial, 6 Final.
     Sur Windows, page 1 est sautée.
     """
+
+    # Niveau micro relayé du thread audio (callback PortAudio) vers le thread
+    # GUI : l'émission d'un signal est thread-safe, Qt fait la queued connection.
+    _vu_level = pyqtSignal(float)
 
     def __init__(self, save_config_fn):
         super().__init__()
@@ -471,9 +534,8 @@ class SetupWizard(QDialog):
         lay.addWidget(lbl_lang)
         lay.addSpacing(6)
         self.lang_combo = QComboBox()
-        self.lang_combo.addItem("🇫🇷  Français", "fr")
-        self.lang_combo.addItem("🇬🇧  English",  "en")
-        self.lang_combo.addItem("🌍  Détection automatique", "auto")
+        for code, label in LANGS:
+            self.lang_combo.addItem(label, code)
         lay.addWidget(self.lang_combo)
         lay.addSpacing(20)
 
@@ -569,6 +631,9 @@ class SetupWizard(QDialog):
         meter_row = QHBoxLayout()
         meter_row.addStretch()
         self._vu = VUMeter(bars=12)
+        # Le signal est émis depuis le thread audio : Qt replanifie
+        # automatiquement set_level sur le thread GUI (queued connection).
+        self._vu_level.connect(self._vu.set_level)
         meter_row.addWidget(self._vu)
         meter_row.addStretch()
         lay.addLayout(meter_row)
@@ -876,10 +941,12 @@ class SetupWizard(QDialog):
             try:
                 import numpy as np
                 level = float(np.sqrt(np.mean(indata.astype("float32") ** 2)))
-                # store for final dB
+                # stocké pour le calcul final en dB
                 self._mic_samples.append(level)
-                # update UI from main thread
-                QTimer.singleShot(0, lambda l=level: self._vu.set_level(min(1.0, l * 6.0)))
+                # Émission de signal thread-safe vers le thread GUI.
+                # (QTimer.singleShot depuis un thread non-Qt est interdit :
+                # "Timers can only be used with threads started with QThread".)
+                self._vu_level.emit(min(1.0, level * 6.0))
             except Exception:
                 pass
 
@@ -957,8 +1024,21 @@ class SetupWizard(QDialog):
         except Exception:
             pass
         if self._downloader and self._downloader.isRunning():
-            self._downloader.quit()
-            self._downloader.wait(30_000)
+            # Ne PAS bloquer ici : quit() est sans effet (run() est bloquant,
+            # pas de boucle d'événements dans le thread) et wait() gelait le
+            # thread GUI jusqu'à 30 s. On déconnecte les signaux, on gare le
+            # thread dans _orphan_threads (référence anti-GC, évite le crash
+            # "QThread: Destroyed while thread is still running") et on ferme
+            # immédiatement : le thread mourra avec le process.
+            for sig in (self._downloader.progress,
+                        self._downloader.finished,
+                        self._downloader.error):
+                try:
+                    sig.disconnect()
+                except TypeError:
+                    pass
+            _park_thread(self._downloader)
+            self._downloader = None
         super().closeEvent(event)
 
 
@@ -985,6 +1065,7 @@ class LicenseDialog(QDialog):
         super().__init__(parent)
         self._allow_trial = allow_trial
         self.trial_chosen = False
+        self._act_worker: _ActivationWorker | None = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -1043,28 +1124,34 @@ class LicenseDialog(QDialog):
             layout.addWidget(self._trial_btn)
 
     def _on_activate(self):
-        from core import license as license_mod
         key = self._key_input.text().strip()
         if not key:
             self._error.setText("Veuillez saisir une clé.")
             return
+        if self._act_worker is not None and self._act_worker.isRunning():
+            return  # activation déjà en cours
         self._btn.setEnabled(False)
         self._btn.setText("Activation…")
         self._error.setText("")
-        try:
-            license_mod.activate(key)
-        except license_mod.LicenseError as e:
-            self._error.setText(f"Échec : {e}")
-            self._btn.setEnabled(True)
-            self._btn.setText("Activer")
-            return
-        except Exception as e:
-            logger.error(f"LicenseDialog.activate: {e}", exc_info=True)
-            self._error.setText(f"Erreur inattendue : {e}")
-            self._btn.setEnabled(True)
-            self._btn.setText("Activer")
-            return
+        # Activation dans un worker (appel réseau ~10 s) : l'UI reste
+        # réactive. Le worker n'a pas de parent et est garé dans
+        # _orphan_threads : si le dialog est fermé/détruit pendant l'appel,
+        # Qt coupe les connexions et le thread meurt avec le process.
+        self._act_worker = _ActivationWorker(key)
+        _park_thread(self._act_worker)
+        self._act_worker.success.connect(self._on_activation_success)
+        self._act_worker.error.connect(self._on_activation_error)
+        self._act_worker.start()
+
+    def _on_activation_success(self):
+        # Slot exécuté sur le thread GUI (queued connection).
         self.accept()
+
+    def _on_activation_error(self, msg: str):
+        # Slot exécuté sur le thread GUI (queued connection).
+        self._error.setText(f"Échec : {msg}")
+        self._btn.setEnabled(True)
+        self._btn.setText("Activer")
 
     def _on_trial(self):
         self.trial_chosen = True

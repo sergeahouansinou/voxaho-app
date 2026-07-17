@@ -2,7 +2,9 @@
 Interception de la touche déclencheur selon la plateforme.
 
   macOS   → CGEventTap (Quartz/PyObjC) — touche Fn
-  Windows → pynput Listener            — touche Ctrl Droit (configurable)
+  Windows → pynput Listener            — touche Ctrl Droit (configurable),
+            avec suppression sélective via win32_event_filter pour que la
+            touche de dictée ne fuie pas vers l'application active (M2/M9)
 
 Requiert sur macOS : permission Accessibilité dans les Réglages Système.
 Requiert sur Windows : aucun droit admin (pynput fonctionne en user).
@@ -21,14 +23,22 @@ IS_MAC = sys.platform == "darwin"
 HOTKEY_LABEL     = "Fn"         if IS_MAC else "Ctrl Droit"
 HOTKEY_HINT      = "Maintenir Fn" if IS_MAC else "Maintenir Ctrl ▶"
 
-# Correspondance nom config → touche pynput (Windows)
-_WIN_KEY_MAP = {
-    "ctrl_r":  None,   # résolu dynamiquement après import pynput
-    "ctrl_l":  None,
-    "alt_r":   None,
-    "shift_r": None,
-    "caps_lock": None,
+# Correspondance nom config → Virtual-Key Code Windows (indépendant de pynput,
+# donc importable/testable sur toute plateforme). Utilisé par win32_event_filter
+# pour identifier la touche cible via data.vkCode.
+WIN_VK_CODES = {
+    "ctrl_r":    0xA3,  # VK_RCONTROL
+    "ctrl_l":    0xA2,  # VK_LCONTROL
+    "alt_r":     0xA5,  # VK_RMENU (Alt droite / AltGr)
+    "shift_r":   0xA1,  # VK_RSHIFT
+    "caps_lock": 0x14,  # VK_CAPITAL
 }
+
+# Messages clavier Windows reçus par le hook bas niveau (WM_*)
+WM_KEYDOWN    = 0x0100
+WM_KEYUP      = 0x0101
+WM_SYSKEYDOWN = 0x0104  # touche pressée avec Alt maintenu
+WM_SYSKEYUP   = 0x0105  # touche relâchée avec Alt maintenu
 
 NX_SECONDARYFNMASK = 0x800000  # flag Fn dans CGEventFlags (macOS)
 
@@ -219,12 +229,50 @@ class HotkeyListener(QObject):
             return
 
     # ── Windows — pynput ──────────────────────────────────────────────────
+    #
+    # ⚠ À valider sur Windows avant release (non exécutable sur macOS).
+    #
+    # Suppression sélective de la touche de dictée (M2/M9) :
+    # sans suppression, maintenir la touche pendant la dictée la laisse fuir
+    # vers l'application active (Ctrl+clic accidentels, raccourcis déclenchés,
+    # et l'option caps_lock BASCULE Verr. Maj à chaque appui). On utilise
+    # `win32_event_filter`, appelé par pynput dans le hook clavier bas niveau
+    # AVANT que l'événement n'atteigne les autres applications : quand la
+    # touche cible est détectée (data.vkCode), on émet fn_pressed/fn_released
+    # puis on appelle `listener.suppress_event()` pour avaler l'événement.
+
+    def _handle_target_press(self):
+        """Appui touche cible — anti-répétition via _fn_active sous _fn_lock.
+
+        Windows envoie des WM_KEYDOWN répétés tant que la touche est maintenue
+        (auto-repeat) : _fn_active garantit une seule émission de fn_pressed.
+        """
+        if self._should_stop:
+            return
+        with self._fn_lock:
+            if not self._fn_active:
+                self._fn_active = True
+                self.fn_pressed.emit()
+
+    def _handle_target_release(self):
+        """Relâchement touche cible — symétrique de _handle_target_press."""
+        if self._should_stop:
+            return
+        with self._fn_lock:
+            if self._fn_active:
+                self._fn_active = False
+                self.fn_released.emit()
 
     def _run_loop_win(self):
         try:
             from pynput import keyboard as kb
 
-            # Résoudre la touche cible
+            # vkCode de la touche cible (identification dans le filter)
+            target_vk = WIN_VK_CODES.get(
+                self._win_key_name, WIN_VK_CODES["ctrl_r"]
+            )
+            # Objet Key pynput correspondant (utilisé par le fallback sans
+            # suppression, où seuls on_press/on_release voient les touches)
             key_map = {
                 "ctrl_r":    kb.Key.ctrl_r,
                 "ctrl_l":    kb.Key.ctrl_l,
@@ -234,27 +282,71 @@ class HotkeyListener(QObject):
             }
             target_key = key_map.get(self._win_key_name, kb.Key.ctrl_r)
 
+            # Filet de sécurité : win32_event_filter + suppress_event existent
+            # depuis pynput 1.4. Sur une version plus ancienne, on retombe sur
+            # le comportement historique SANS suppression (la touche fuit vers
+            # l'app active, mais la dictée reste fonctionnelle).
+            supports_suppression = hasattr(kb.Listener, "suppress_event")
+
+            def _win32_event_filter(msg, data):
+                """Hook bas niveau : intercepte la touche cible avant les apps.
+
+                Reçoit (msg, data) où data est un KBDLLHOOKSTRUCT ;
+                data.vkCode identifie la touche physique.
+                """
+                if data.vkCode != target_vk:
+                    return True  # autres touches : laisser passer normalement
+                if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    self._handle_target_press()
+                elif msg in (WM_KEYUP, WM_SYSKEYUP):
+                    self._handle_target_release()
+                # ⚠ suppress_event() supprime l'événement en levant une
+                # exception interne pynput → TOUJOURS l'appeler en DERNIER.
+                # C'est ce qui empêche la touche d'atteindre les autres apps
+                # (et corrige le toggle Verr. Maj pour l'option caps_lock).
+                self._win_listener.suppress_event()
+
+            # Callbacks on_press/on_release :
+            #   - mode suppression : la touche cible étant avalée par le filter,
+            #     ils ne la voient jamais — ils ne servent que de filet
+            #     (no-op pour les autres touches, et redondance inoffensive
+            #     pour la cible grâce à l'anti-répétition de _handle_target_*).
+            #   - mode fallback (vieux pynput) : ils portent toute la logique.
             def on_press(key):
                 if self._should_stop:
                     return False
                 if key == target_key:
-                    with self._fn_lock:
-                        if not self._fn_active:
-                            self._fn_active = True
-                            self.fn_pressed.emit()
+                    self._handle_target_press()
 
             def on_release(key):
                 if self._should_stop:
                     return False
                 if key == target_key:
-                    with self._fn_lock:
-                        if self._fn_active:
-                            self._fn_active = False
-                            self.fn_released.emit()
+                    self._handle_target_release()
 
-            self._win_listener = kb.Listener(
-                on_press=on_press, on_release=on_release
-            )
+            if supports_suppression:
+                try:
+                    self._win_listener = kb.Listener(
+                        on_press=on_press,
+                        on_release=on_release,
+                        win32_event_filter=_win32_event_filter,
+                    )
+                except TypeError as e:
+                    # Constructeur qui refuse le kwarg (pynput exotique) —
+                    # ne pas tuer le hotkey pour autant, retomber en fallback
+                    logger.warning(f"win32_event_filter refusé par pynput: {e}")
+                    supports_suppression = False
+
+            if not supports_suppression:
+                logger.warning(
+                    "pynput sans win32_event_filter/suppress_event — la touche "
+                    "de dictée ne sera PAS supprimée et fuira vers "
+                    "l'application active. Mettez à jour : pip install -U pynput"
+                )
+                self._win_listener = kb.Listener(
+                    on_press=on_press, on_release=on_release
+                )
+
             self._win_listener.start()
             self._win_listener.join()
 

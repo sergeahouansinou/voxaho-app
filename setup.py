@@ -4,9 +4,13 @@ Lancer avec : python setup.py py2app
 """
 from setuptools import setup
 
+# Version centralisée : core/__init__.py est la source unique de vérité
+# (setup.py est à la racine du projet, l'import fonctionne directement).
+from core import __version__
+
 APP     = ['main.py']
 NAME    = 'Voxaho'
-VERSION = '1.0.5'
+VERSION = __version__
 
 OPTIONS = {
     'argv_emulation': False,        # désactivé : on utilise PyQt6

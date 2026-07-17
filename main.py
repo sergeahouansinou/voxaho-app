@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import logging
+import threading
 
 logging.basicConfig(level=logging.WARNING, format="%(name)s [%(levelname)s] %(message)s")
 
@@ -89,6 +90,16 @@ def _ensure_licensed_or_trial(app, license_mod) -> bool:
     """
     # Cas 1 : déjà licencié → on continue.
     if license_mod.is_activated():
+        # Re-validation périodique en ARRIÈRE-PLAN (thread daemon) : l'appel
+        # réseau Lemon Squeezy a un timeout de 10 s et ne doit jamais retarder
+        # le démarrage. Le résultat n'affecte que le prochain lancement : si la
+        # clé s'avère révoquée/remboursée, revalidate_if_due() purge la licence
+        # stockée et le gate licence/trial reprendra la main au démarrage suivant.
+        threading.Thread(
+            target=license_mod.revalidate_if_due,
+            name="voxaho-license-revalidate",
+            daemon=True,
+        ).start()
         return True
 
     # Cas 2 : trial encore valide → on continue.

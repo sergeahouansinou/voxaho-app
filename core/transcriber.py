@@ -14,15 +14,107 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-FRENCH_FILLERS = [
-    "donc voilà", "enfin voilà", "ouais ben", "bon ben",
-    "euh", "ben", "bah", "voilà", "enfin", "hein", "quoi",
-    "nan nan", "ouais ouais", "ok donc",
+# Sons d'hésitation par langue. UNIQUEMENT des sons purs, jamais de vrais mots :
+# tout terme pouvant être un mot légitime de la langue (ex. "like" en anglais,
+# "quoi"/"ben" en français, "um" en allemand, "eh"/"este" en espagnol) est
+# volontairement exclu pour ne jamais détruire une vraie dictée.
+# Langue absente du dict → aucune suppression de fillers.
+FILLERS_BY_LANG = {
+    "fr": ["euh", "heu", "hum", "hem"],
+    "en": ["uh", "um", "erm", "uhm", "mm-hmm"],
+    "es": ["em", "ehm"],
+    "de": ["äh", "ähm", "öhm", "hm"],
+    "it": ["ehm", "uhm", "mah"],
+}
+
+# Phrases connues que Whisper hallucine sur du silence ou du bruit
+# (crédits de sous-titres, appels à s'abonner, remerciements de fin de vidéo).
+# Elles sont comparées après normalisation (minuscules, sans ponctuation,
+# espaces réduits) et ne filtrent un segment que si le motif couvre
+# la quasi-totalité du segment — voir _is_hallucination().
+HALLUCINATION_PATTERNS = [
+    # Français
+    "sous-titres réalisés par la communauté d'amara.org",
+    "sous-titres réalisés par la communauté",
+    "sous-titres réalisés par soustitreur.com",
+    "sous-titrage société radio-canada",
+    "sous-titrage st' 501",
+    "merci d'avoir regardé cette vidéo",
+    "merci d'avoir regardé la vidéo",
+    "merci d'avoir regardé",
+    "n'hésitez pas à vous abonner",
+    "abonnez-vous à la chaîne",
+    "abonnez-vous",
+    # Anglais
+    "subtitles by the amara.org community",
+    "subs by www.zeoranger.co.uk",
+    "subtitles by",
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe to my channel",
+    "don't forget to like and subscribe",
+    "subscribe to the channel",
+    "please subscribe",
+    "subscribe",
+    # Espagnol
+    "subtítulos realizados por la comunidad de amara.org",
+    "subtítulos por",
+    "gracias por ver el vídeo",
+    "gracias por ver",
+    "suscríbete al canal",
+    "suscríbete",
+    # Allemand
+    "untertitelung aufgrund der amara.org-community",
+    "untertitel der amara.org-community",
+    "untertitel im auftrag des zdf für funk",
+    "untertitel im auftrag des zdf",
+    "untertitel von stephanie geiges",
+    "vielen dank fürs zuschauen",
+    "danke fürs zuschauen",
+    # Italien
+    "sottotitoli creati dalla comunità amara.org",
+    "sottotitoli e revisione a cura di qtss",
+    "sottotitoli a cura di",
+    "grazie per aver guardato il video",
+    "grazie per aver guardato",
+    "iscriviti al canale",
+    # Génériques
+    "amara.org",
+    "www.mooji.org",
+    "www.",
 ]
-ENGLISH_FILLERS = [
-    "you know", "i mean", "kind of", "sort of",
-    "uh", "um", "like", "basically", "literally",
-]
+
+
+def _normalize_for_blocklist(text: str) -> str:
+    """Normalise un texte pour comparaison avec la blocklist :
+    minuscules, ponctuation remplacée par des espaces, espaces réduits."""
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+_HALLUCINATION_PATTERNS_NORM = sorted(
+    {_normalize_for_blocklist(p) for p in HALLUCINATION_PATTERNS},
+    key=len, reverse=True,
+)
+
+
+def _is_hallucination(text: str) -> bool:
+    """Retourne True si le segment ENTIER correspond à une hallucination connue.
+
+    Un motif ne déclenche le filtrage que s'il couvre au moins 80 % du segment
+    normalisé : une vraie phrase dictée qui ne fait que CITER le motif
+    (ex. « va sur amara.org pour voir les sous-titres ») est donc conservée,
+    tandis qu'un segment isolé « Sous-titres réalisés par la communauté
+    d'Amara.org » est supprimé.
+    """
+    norm = _normalize_for_blocklist(text)
+    if not norm:
+        return False
+    for pattern in _HALLUCINATION_PATTERNS_NORM:
+        if pattern in norm and len(pattern) >= 0.8 * len(norm):
+            return True
+    return False
 
 
 class Transcriber:
@@ -83,7 +175,21 @@ class Transcriber:
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 300},
             )
-            text = " ".join(seg.text.strip() for seg in segments).strip()
+            # Filtrer les hallucinations de Whisper générées sur silence/bruit :
+            # segments quasi muets peu fiables + phrases fantômes de la blocklist.
+            textes = []
+            for seg in segments:
+                seg_text = seg.text.strip()
+                if not seg_text:
+                    continue
+                no_speech_prob = getattr(seg, "no_speech_prob", 0.0)
+                avg_logprob    = getattr(seg, "avg_logprob", 0.0)
+                if no_speech_prob > 0.6 and avg_logprob < -0.8:
+                    continue  # probablement du silence mal interprété
+                if _is_hallucination(seg_text):
+                    continue  # phrase fantôme connue (ex. crédits de sous-titres)
+                textes.append(seg_text)
+            text = " ".join(textes).strip()
 
             detected_lang = info.language if self.language is None else self.language
             if self.reformatting:
@@ -123,8 +229,9 @@ class Transcriber:
         for i, url in enumerate(urls):
             text = text.replace(url, placeholder.format(i=i), 1)
 
-        # Supprimer les mots de remplissage
-        fillers = FRENCH_FILLERS if lang == "fr" else ENGLISH_FILLERS
+        # Supprimer les sons d'hésitation propres à la langue détectée.
+        # Langue inconnue ou non listée → aucune suppression de fillers.
+        fillers = FILLERS_BY_LANG.get(lang or "", [])
         for filler in sorted(fillers, key=len, reverse=True):  # long → court pour éviter chevauchement
             text = re.sub(
                 r"(?<!\w)" + re.escape(filler) + r"(?!\w)",
@@ -138,11 +245,12 @@ class Transcriber:
         text = re.sub(r"\s([,.!?:;])", r"\1", text)
         text = re.sub(r"([.!?])\s*[.!?]+", r"\1", text)  # double ponctuation
 
-        # Majuscule début de phrase
+        # Majuscule début de phrase (Unicode : gère aussi ä, ö, ü, ñ, í, ó…)
         text = re.sub(
-            r"([.!?]\s+)([a-zàâçéèêëîïôùûüæœ])",
-            lambda m: m.group(1) + m.group(2).upper(),
+            r"([.!?]\s+)(\w)",
+            lambda m: m.group(1) + (m.group(2).upper() if m.group(2).islower() else m.group(2)),
             text,
+            flags=re.UNICODE,
         )
 
         text = text.strip()

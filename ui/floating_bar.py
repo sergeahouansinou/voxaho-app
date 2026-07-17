@@ -50,6 +50,44 @@ DUR_REC_PULSE = 0.20   # bump scale au passage RECORDING
 IS_MAC = sys.platform == "darwin"
 logger = logging.getLogger(__name__)
 
+# Titre unique de la fenêtre barre (invisible : fenêtre frameless) — sert à
+# cibler UNIQUEMENT la NSWindow de la barre dans _force_always_on_top (M6).
+BAR_WINDOW_TITLE = "VoxahoBar"
+
+# Marge appliquée quand la barre doit être ramenée dans la zone visible (M5)
+CLAMP_MARGIN = 8
+
+
+def clamp_to_screen(x: int, y: int, w: int, h: int,
+                    screen_rect: tuple[int, int, int, int]) -> tuple[int, int]:
+    """Ramène le rectangle (x, y, w, h) dans la zone visible de l'écran (M5).
+
+    Fonction pure (testable sans Qt). `screen_rect` = (sx, sy, sw, sh).
+
+    Règles :
+      - Coordonnées déjà entièrement visibles → inchangées (x=0 sur le bord
+        gauche est une position légitime, elle est conservée).
+      - Coordonnées hors écran (ex. écran externe débranché) → ramenées dans
+        la zone visible avec une marge de CLAMP_MARGIN px du bord.
+      - Barre plus grande que l'écran → coin haut-gauche + marge.
+    """
+    sx, sy, sw, sh = screen_rect
+
+    def _clamp_axis(v: int, size: int, s0: int, s_len: int) -> int:
+        lo = s0                  # première position entièrement visible
+        hi = s0 + s_len - size   # dernière position entièrement visible
+        if hi < lo:
+            # Barre plus grande que l'écran sur cet axe → bord haut/gauche + marge
+            return s0 + CLAMP_MARGIN
+        if v < lo:
+            return min(lo + CLAMP_MARGIN, hi)
+        if v > hi:
+            return max(hi - CLAMP_MARGIN, lo)
+        return v  # position valide : ne pas toucher
+
+    return (int(_clamp_axis(int(x), int(w), int(sx), int(sw))),
+            int(_clamp_axis(int(y), int(h), int(sy), int(sh))))
+
 # ── Dimensions ────────────────────────────────────────────────────────────────
 MINI_W         = 40   # défaut "medium" (override possible par config: mini_size)
 MINI_H         = 8
@@ -185,6 +223,9 @@ class FloatingBar(QWidget):
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint
         )
+        # Titre unique — invisible (frameless) mais permet à
+        # _force_always_on_top de ne cibler QUE la NSWindow de la barre (M6)
+        self.setWindowTitle(BAR_WINDOW_TITLE)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
@@ -194,8 +235,19 @@ class FloatingBar(QWidget):
         self.setMaximumSize(BAR_W + 10, BAR_H_EXPANDED + 10)
 
         screen  = QApplication.primaryScreen().geometry()
-        full_x  = self.config.get("bar_x") or (screen.width()  - BAR_W) // 2
-        full_y  = self.config.get("bar_y") or (screen.height() - BAR_H - 64)
+        # `is not None` : bar_x=0 (bord gauche) est une valeur légitime — un
+        # simple `or` la traitait comme absente (M5)
+        saved_x = self.config.get("bar_x")
+        saved_y = self.config.get("bar_y")
+        full_x  = saved_x if saved_x is not None else (screen.width()  - BAR_W) // 2
+        full_y  = saved_y if saved_y is not None else (screen.height() - BAR_H - 64)
+
+        # Re-borner : après un changement d'écran (externe débranché…), les
+        # coords sauvegardées peuvent être hors de toute zone visible (M5)
+        full_x, full_y = clamp_to_screen(
+            int(full_x), int(full_y), BAR_W, BAR_H,
+            (screen.x(), screen.y(), screen.width(), screen.height()),
+        )
 
         self._anchor_cx = full_x + BAR_W // 2
         self._anchor_cy = full_y + BAR_H // 2
@@ -224,12 +276,19 @@ class FloatingBar(QWidget):
         self._force_always_on_top()
 
     def _force_always_on_top(self):
-        """NSModalPanelWindowLevel (8) + CanJoinAllSpaces + IgnoresCycle."""
+        """NSModalPanelWindowLevel (8) + CanJoinAllSpaces + IgnoresCycle.
+
+        Cible UNIQUEMENT la NSWindow de la barre via son titre unique
+        (BAR_WINDOW_TITLE) — sinon toutes les fenêtres NSApp (Préférences,
+        wizard…) passaient aussi en niveau modal-panel + toutes-les-spaces (M6).
+        """
         if not IS_MAC:
             return
         try:
             from AppKit import NSApp
             for win in NSApp.windows():
+                if win.title() != BAR_WINDOW_TITLE:
+                    continue  # ne pas toucher aux autres fenêtres (M6)
                 win.setLevel_(8)  # NSModalPanelWindowLevel — passe devant Spotlight
                 win.setCollectionBehavior_(
                     1   |  # NSWindowCollectionBehaviorCanJoinAllSpaces
@@ -248,13 +307,31 @@ class FloatingBar(QWidget):
         )
 
     def _setup_hotkey(self):
+        self._start_hotkey(self.config.get("win_key", "ctrl_r"))
+
+    def _start_hotkey(self, win_key: str):
+        """Crée le HotkeyListener, connecte ses 4 signaux et le démarre."""
         from core.hotkey import HotkeyListener
-        self._hotkey = HotkeyListener(win_key=self.config.get("win_key", "ctrl_r"))
+        self._hotkey = HotkeyListener(win_key=win_key)
         self._hotkey.fn_pressed.connect(self._on_fn_press)
         self._hotkey.fn_released.connect(self._on_fn_release)
         self._hotkey.permission_error.connect(self._on_permission_error)
         self._hotkey.permission_restored.connect(self._on_permission_restored)
         self._hotkey.start()
+
+    def _restart_hotkey(self, win_key: str):
+        """Reconfigure la touche de dictée à chaud (M1).
+
+        Arrête proprement l'ancien listener puis en démarre un nouveau avec
+        la nouvelle touche — sans ça, un changement de touche dans les
+        Préférences n'était pris en compte qu'au redémarrage.
+        """
+        try:
+            if getattr(self, "_hotkey", None) is not None:
+                self._hotkey.stop()
+        except Exception as e:
+            logger.warning(f"_restart_hotkey — arrêt ancien listener: {e}")
+        self._start_hotkey(win_key)
 
     def _setup_timers(self):
         self._anim_timer = QTimer(self)
@@ -372,9 +449,25 @@ class FloatingBar(QWidget):
             self._state_signal.emit(self.IDLE)
 
     def _on_transcription(self, text: str):
+        """Slot Qt (thread principal) — délègue l'injection à un thread dédié.
+
+        inject_text contient des sleeps bloquants (délai copie→collage, voire
+        restauration presse-papiers) : l'exécuter ici gelait l'UI ~200 ms à
+        chaque dictée (C4a). Le retour à IDLE (ou ERROR) se fait via
+        _state_signal, déjà thread-safe.
+        """
         from core.injector import inject_text
-        inject_text(text)
-        self._set_state(self.IDLE)
+
+        def _run():
+            try:
+                inject_text(text)
+            except Exception as e:
+                logger.error(f"Injection: {e}", exc_info=True)
+                self._state_signal.emit(self.ERROR)
+            else:
+                self._state_signal.emit(self.IDLE)
+
+        threading.Thread(target=_run, daemon=True, name="Injection").start()
 
     def _set_state(self, state: str):
         prev_state = self.state
@@ -795,21 +888,38 @@ class FloatingBar(QWidget):
     # ── Config à chaud ────────────────────────────────────────────────────────
 
     def apply_config(self, new_config: dict):
+        old_win_key = self.config.get("win_key", "ctrl_r")
         self.config = new_config
         self._transcriber.language     = None if new_config.get("language") == "auto" else new_config.get("language", "fr")
         self._transcriber.reformatting = new_config.get("reformatting", True)
         self._transcriber.update_model(new_config.get("model", "small"))
+
+        # Touche de dictée Windows à chaud (M1) — la touche macOS (Fn) est
+        # fixe, pas de reconfiguration nécessaire sur Mac
+        new_win_key = new_config.get("win_key", "ctrl_r")
+        if not IS_MAC and new_win_key != old_win_key:
+            self._restart_hotkey(new_win_key)
 
         # Apparence (taille mini + accent) — répercuté sur géométrie + repaint
         self._apply_appearance(new_config)
 
         # Repositionnement éventuel selon bar_position
         pos = new_config.get("bar_position", "custom")
+        screen = QApplication.primaryScreen().geometry()
         if pos in ("top", "bottom"):
-            screen = QApplication.primaryScreen().geometry()
             self._anchor_cx = screen.width() // 2
             self._anchor_cy = (64 + BAR_H // 2) if pos == "top" \
                               else (screen.height() - 64 - BAR_H // 2)
+
+        # Re-borner la position dans l'écran courant (M5) — l'ancre peut
+        # référencer un écran qui n'existe plus (moniteur débranché)
+        full_x, full_y = clamp_to_screen(
+            self._anchor_cx - BAR_W // 2, self._anchor_cy - BAR_H // 2,
+            BAR_W, BAR_H,
+            (screen.x(), screen.y(), screen.width(), screen.height()),
+        )
+        self._anchor_cx = full_x + BAR_W // 2
+        self._anchor_cy = full_y + BAR_H // 2
 
         self._apply_geometry()
         self.update()
