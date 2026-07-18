@@ -422,7 +422,9 @@ class WorkspaceWindow(QMainWindow):
         # Navigation principale.
         self.nav = QListWidget(objectName="nav")
         self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # AsNeeded : si la fenêtre est trop courte pour les 7 sections, on défile
+        # au lieu de couper les derniers items (Statistiques / Réunion).
+        self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.nav.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # Ordre synchronisé avec l'ajout des pages au QStackedWidget (_setup_ui).
         for label in ["🏠  Accueil", "🕘  Historique", "📝  Notes",
@@ -431,9 +433,10 @@ class WorkspaceWindow(QMainWindow):
             it = QListWidgetItem(label)
             it.setSizeHint(QSize(0, 42))
             self.nav.addItem(it)
-        lay.addWidget(self.nav)
-
-        lay.addStretch(1)
+        # Facteur d'étirement 1 : la liste remplit toute la hauteur disponible
+        # entre le header et « Réglages » → les 7 sections sont visibles (avant,
+        # sans stretch, la liste gardait sa hauteur par défaut et coupait la fin).
+        lay.addWidget(self.nav, 1)
 
         # Séparateur + bas de sidebar : « Réglages ».
         sep = QFrame(objectName="sep")
