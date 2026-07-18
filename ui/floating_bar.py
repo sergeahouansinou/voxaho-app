@@ -441,6 +441,68 @@ class FloatingBar(QWidget):
         except Exception as e:
             logger.warning(f"_apply_translate_to: {e}")
 
+    def _apply_active_profile(self):
+        """Applique les réglages effectifs selon l'application active (Phase 3b).
+
+        Détecte l'app au premier plan (core.appcontext), résout le profil
+        correspondant (core.profiles) puis calcule les réglages EFFECTIFS =
+        défauts de la config surchargés par le profil. On applique TOUJOURS ces
+        réglages effectifs — profil OU défauts — de sorte qu'en l'ABSENCE de
+        profil correspondant on revienne aux défauts de la config (aucune fuite
+        du profil de la dictée précédente).
+
+        Réglages lus à l'exécution de transcribe() (langue, reformatage, IA,
+        traduction) → applicables à chaud via update_settings ; le modèle exige
+        un rechargement, on ne le change donc QUE s'il diffère réellement
+        (update_model gère déjà l'idempotence).
+
+        Entièrement DÉFENSIF (import différé + try/except larges) : la détection
+        ou l'application d'un profil ne doit JAMAIS empêcher la dictée.
+        """
+        try:
+            from core import appcontext, profiles
+        except Exception as e:
+            logger.debug(f"Profils par app indisponibles (import): {e}")
+            return
+        try:
+            app = appcontext.active_app()
+            prof = profiles.resolve_for_app(app)
+            eff = profiles.effective_settings(self.config, prof)
+        except Exception as e:
+            logger.debug(f"Résolution du profil ignorée: {e}")
+            return
+
+        # Langue + reformatage : hot-swap via update_settings, repli setattr direct
+        # (contrat moteur historique : ces deux réglages existent de longue date).
+        try:
+            update = getattr(self._transcriber, "update_settings", None)
+            if not callable(update):
+                raise AttributeError("update_settings absent")
+            update(language=eff.get("language"), reformatting=eff.get("reformatting"))
+        except Exception:
+            try:
+                lang = eff.get("language")
+                if lang is not None:
+                    self._transcriber.language = None if lang == "auto" else lang
+                reformatting = eff.get("reformatting")
+                if reformatting is not None:
+                    self._transcriber.reformatting = bool(reformatting)
+            except Exception as e:
+                logger.debug(f"language/reformatting (profil) ignorés: {e}")
+
+        # IA + traduction : réutilise les helpers défensifs existants
+        # (update_settings avec repli setattr, tolérants au kwarg absent).
+        self._apply_ai_reformat(bool(eff.get("ai_reformat")))
+        self._apply_translate_to(eff.get("translate_to"))
+
+        # Modèle : ne recharger que s'il change réellement.
+        try:
+            model = eff.get("model")
+            if model and model != getattr(self._transcriber, "model_name", None):
+                self._transcriber.update_model(model)
+        except Exception as e:
+            logger.debug(f"update_model (profil) ignoré: {e}")
+
     def _recreate_transcriber(self):
         """Recrée le Transcriber (backend changé) : unload → new → preload.
 
@@ -538,6 +600,11 @@ class FloatingBar(QWidget):
                 pass
 
         self._state_signal.emit(self.RECORDING)
+
+        # Profils par application (Phase 3b) : au DÉBUT de la dictée, applique les
+        # réglages effectifs selon l'app au premier plan (profil OU défauts de la
+        # config). Entièrement défensif — ne doit jamais empêcher la dictée.
+        self._apply_active_profile()
 
         try:
             from core.recorder import Recorder

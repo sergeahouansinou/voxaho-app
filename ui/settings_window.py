@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QCheckBox, QLineEdit, QStackedWidget, QListWidget,
     QListWidgetItem, QButtonGroup, QRadioButton, QSlider, QFrame,
-    QSpacerItem, QSizePolicy, QMessageBox, QProgressDialog,
+    QSpacerItem, QSizePolicy, QMessageBox, QProgressDialog, QScrollArea,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QEventLoop, QThread
 from PyQt6.QtGui import QFont, QColor
@@ -94,6 +94,9 @@ LANGS = [
     ("auto", "🌍  Auto"),
 ]
 
+# Table code langue → libellé (drapeau + nom natif) pour les résumés de profils.
+_LANG_LABELS = {code: label for code, label in LANGS}
+
 # Liste des modèles Whisper (code, libellé combo, description perf).
 # large-v3-turbo est le meilleur compromis mis en avant (« ✓ Recommandé ») ;
 # small reste le défaut léger (rapide, empreinte disque minimale).
@@ -164,6 +167,51 @@ def _translator_available() -> bool:
         return bool(translator.is_available())
     except Exception:
         return False
+
+
+def _profiles_module():
+    """Import différé et défensif du module « profils par application » (Phase 3b).
+
+    core.profiles vit dans la couche de données locale ; on renvoie le module
+    seulement s'il expose l'API du contrat (list/add/update/remove), sinon None
+    — l'onglet Profils affiche alors « Fonctionnalité indisponible » plutôt que
+    de casser. Aucune exception ne remonte.
+    """
+    try:
+        from core import profiles
+    except Exception:
+        return None
+    needed = ("list_profiles", "add_profile", "update_profile", "remove_profile")
+    if not all(hasattr(profiles, attr) for attr in needed):
+        return None
+    return profiles
+
+
+def _profile_overrides_summary(profile: dict) -> str:
+    """Résumé lisible des surcharges d'un profil (fonction pure, testable).
+
+    Ne liste que les champs réellement surchargés (non None). Aucune surcharge →
+    mention explicite que les réglages par défaut s'appliquent.
+    """
+    parts: list[str] = []
+    lang = profile.get("language")
+    if lang:
+        parts.append(_LANG_LABELS.get(lang, lang))
+    model = profile.get("model")
+    if model:
+        parts.append(f"Modèle {model}")
+    reformatting = profile.get("reformatting")
+    if reformatting is not None:
+        parts.append("Reformatage " + ("activé" if reformatting else "désactivé"))
+    ai = profile.get("ai_reformat")
+    if ai is not None:
+        parts.append("IA " + ("activée" if ai else "désactivée"))
+    translate_to = profile.get("translate_to")
+    if translate_to:
+        parts.append("Traduire → " + _LANG_LABELS.get(translate_to, translate_to))
+    if not parts:
+        return "Aucune surcharge — utilise les réglages par défaut."
+    return "  ·  ".join(parts)
 
 
 def ai_status_label(available: bool, ready: bool) -> str:
@@ -318,6 +366,18 @@ QSlider::handle:horizontal {
 }
 
 QFrame#sep { background: #2C2C2E; max-height: 1px; border: none; }
+
+QScrollArea { background: transparent; border: none; }
+QFrame#profile-card {
+    background: #232325; border: 1px solid #3A3A3C; border-radius: 10px;
+}
+QLabel#card-title { color: #FFFFFF; font-size: 14px; font-weight: 600; }
+QPushButton#chip {
+    background-color: #2C2C2E; color: #EBEBF5;
+    border: 1px solid #3A3A3C; border-radius: 7px;
+    padding: 5px 12px; font-size: 12px;
+}
+QPushButton#chip:hover { background-color: #38383A; }
 """
 
 
@@ -399,7 +459,7 @@ class SettingsWindow(QDialog):
         self.nav = QListWidget(objectName="nav")
         self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         for label in ["⚙   Général", "🧠  Modèle", "🎙  Micro", "⌨   Touche",
-                      "🎨  Apparence", "🔑  Licence", "ℹ   À propos"]:
+                      "🎨  Apparence", "🎯  Profils", "🔑  Licence", "ℹ   À propos"]:
             it = QListWidgetItem(label)
             it.setSizeHint(QSize(0, 40))
             self.nav.addItem(it)
@@ -418,6 +478,7 @@ class SettingsWindow(QDialog):
         self.stack.addWidget(self._build_mic_tab())
         self.stack.addWidget(self._build_hotkey_tab())
         self.stack.addWidget(self._build_appearance_tab())
+        self.stack.addWidget(self._build_profiles_tab())
         self.stack.addWidget(self._build_license_tab())
         self.stack.addWidget(self._build_about_tab())
         right_lay.addWidget(self.stack, 1)
@@ -967,6 +1028,284 @@ class SettingsWindow(QDialog):
     def _on_size_change(self, v: int):
         self.lb_size.setText(["Small", "Medium", "Large"][v])
         self._emit_preview()
+
+    # ── Onglet Profils (par application) ─────────────────────────────────────
+    def _build_profiles_tab(self) -> QWidget:
+        """Onglet « 🎯 Profils » — réglages automatiques selon l'app active.
+
+        Les profils vivent dans la base locale (core.profiles), PAS dans
+        self.config : cet onglet ne touche donc ni _load_values ni _collect. Il
+        gère son propre cycle CRUD (liste de cartes + formulaire d'ajout/édition).
+        Import défensif : composant absent → « Fonctionnalité indisponible ».
+        """
+        w, lay = self._tab_container(
+            "Profils", "Réglages automatiques selon l'application active"
+        )
+
+        # id du profil en cours d'édition (None = mode ajout).
+        self._editing_profile_id = None
+
+        prof_mod = _profiles_module()
+        if prof_mod is None:
+            note = QLabel(
+                "Fonctionnalité indisponible sur cette installation.",
+                objectName="desc",
+            )
+            note.setWordWrap(True)
+            lay.addWidget(note)
+            lay.addStretch(1)
+            return w
+
+        intro = QLabel(
+            "Créez un profil par application : dès qu'elle passe au premier plan, "
+            "Voxaho applique automatiquement la langue, le modèle et le reformatage "
+            "choisis. Sans profil correspondant, vos réglages par défaut "
+            "s'appliquent — 100 % local.",
+            objectName="desc",
+        )
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        # ── Liste des profils (cartes) dans une zone défilante ────────────────
+        lay.addWidget(self._section_label("Vos profils"))
+        self._profiles_scroll = QScrollArea()
+        self._profiles_scroll.setWidgetResizable(True)
+        self._profiles_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._profiles_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        host = QWidget()
+        self._profiles_list_lay = QVBoxLayout(host)
+        self._profiles_list_lay.setContentsMargins(0, 0, 0, 0)
+        self._profiles_list_lay.setSpacing(8)
+        self._profiles_scroll.setWidget(host)
+        lay.addWidget(self._profiles_scroll, 1)
+
+        # ── Formulaire d'ajout / édition ──────────────────────────────────────
+        lay.addWidget(self._section_label("Ajouter un profil"))
+
+        self.ed_prof_name = QLineEdit()
+        self.ed_prof_name.setPlaceholderText("Nom (optionnel)")
+        self.ed_prof_pattern = QLineEdit()
+        self.ed_prof_pattern.setPlaceholderText("ex. Code, Mail, chrome")
+        row1 = QHBoxLayout()
+        row1.setSpacing(12)
+        row1.addLayout(self._labeled_field("Nom", self.ed_prof_name), 1)
+        row1.addLayout(self._labeled_field("Application (motif)", self.ed_prof_pattern), 1)
+        lay.addLayout(row1)
+
+        # Langue : « (défaut) » = ne pas surcharger, sinon une langue de LANGS.
+        self.cb_prof_lang = QComboBox()
+        self.cb_prof_lang.addItem("(défaut)", None)
+        for code, label in LANGS:
+            self.cb_prof_lang.addItem(label, code)
+        # Modèle : « (défaut) » + modèles Whisper.
+        self.cb_prof_model = QComboBox()
+        self.cb_prof_model.addItem("(défaut)", None)
+        for code, label, _ in MODELS:
+            self.cb_prof_model.addItem(label, code)
+        row2 = QHBoxLayout()
+        row2.setSpacing(12)
+        row2.addLayout(self._labeled_field("Langue", self.cb_prof_lang), 1)
+        row2.addLayout(self._labeled_field("Modèle", self.cb_prof_model), 1)
+        lay.addLayout(row2)
+
+        # Reformatage & IA : trois états explicites « (défaut) / Activé / Désactivé »
+        # — un combo (et non une case binaire) est nécessaire pour distinguer
+        # « garder le défaut de la config » (None) de « forcer activé/désactivé ».
+        self.cb_prof_reformat = self._tri_state_combo()
+        self.cb_prof_ai = self._tri_state_combo()
+        row3 = QHBoxLayout()
+        row3.setSpacing(12)
+        row3.addLayout(self._labeled_field("Reformatage", self.cb_prof_reformat), 1)
+        row3.addLayout(self._labeled_field("Reformatage IA", self.cb_prof_ai), 1)
+        lay.addLayout(row3)
+
+        # Traduire vers : « (défaut) » + langues (hors « auto », cible précise).
+        self.cb_prof_translate = QComboBox()
+        self.cb_prof_translate.addItem("(défaut)", None)
+        for code, label in LANGS:
+            if code == "auto":
+                continue
+            self.cb_prof_translate.addItem(label, code)
+
+        self.btn_prof_add = QPushButton("+ Ajouter", objectName="primary")
+        self.btn_prof_add.clicked.connect(self._on_add_profile)
+        row4 = QHBoxLayout()
+        row4.setSpacing(12)
+        row4.addLayout(self._labeled_field("Traduire vers", self.cb_prof_translate), 1)
+        btn_box = QVBoxLayout()
+        btn_box.setSpacing(4)
+        btn_box.addWidget(QLabel(" ", objectName="hint"))  # aligne le bouton sur le combo
+        btn_box.addWidget(self.btn_prof_add)
+        row4.addLayout(btn_box, 1)
+        lay.addLayout(row4)
+
+        self._refresh_profiles_list()
+        return w
+
+    def _labeled_field(self, text: str, widget) -> QVBoxLayout:
+        """Petit label (style hint) au-dessus d'un widget de formulaire."""
+        box = QVBoxLayout()
+        box.setSpacing(4)
+        box.addWidget(QLabel(text, objectName="hint"))
+        box.addWidget(widget)
+        return box
+
+    def _tri_state_combo(self) -> QComboBox:
+        """Combo à trois états : (défaut)=None, Activé=True, Désactivé=False."""
+        cb = QComboBox()
+        for label, data in (("(défaut)", None), ("Activé", True), ("Désactivé", False)):
+            cb.addItem(label, data)
+        return cb
+
+    def _refresh_profiles_list(self):
+        """(Re)construit la liste des cartes de profils depuis core.profiles."""
+        # Vider la liste existante.
+        while self._profiles_list_lay.count():
+            item = self._profiles_list_lay.takeAt(0)
+            wdg = item.widget()
+            if wdg is not None:
+                wdg.deleteLater()
+
+        prof_mod = _profiles_module()
+        profs = []
+        if prof_mod is not None:
+            try:
+                profs = prof_mod.list_profiles()
+            except Exception as e:
+                logger.warning(f"list_profiles: {e}")
+                profs = []
+
+        if not profs:
+            empty = QLabel("Aucun profil pour l'instant.", objectName="hint")
+            self._profiles_list_lay.addWidget(empty)
+            self._profiles_list_lay.addStretch(1)
+            return
+
+        for p in profs:
+            self._profiles_list_lay.addWidget(self._make_profile_card(p))
+        self._profiles_list_lay.addStretch(1)
+
+    def _make_profile_card(self, profile: dict) -> QWidget:
+        """Carte visuelle d'un profil : titre + motif + résumé + éditer/supprimer."""
+        card = QFrame(objectName="profile-card")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(12, 10, 12, 10)
+        cl.setSpacing(4)
+
+        top = QHBoxLayout()
+        title = profile.get("name") or profile.get("app_pattern") or "Profil"
+        top.addWidget(QLabel(str(title), objectName="card-title"))
+        top.addStretch(1)
+        pid = profile.get("id")
+        btn_edit = QPushButton("Éditer", objectName="chip")
+        btn_edit.clicked.connect(lambda _=False, i=pid: self._edit_profile(i))
+        btn_del = QPushButton("Supprimer", objectName="danger")
+        btn_del.clicked.connect(lambda _=False, i=pid: self._delete_profile(i))
+        top.addWidget(btn_edit)
+        top.addSpacing(6)
+        top.addWidget(btn_del)
+        cl.addLayout(top)
+
+        cl.addWidget(QLabel(f"App : « {profile.get('app_pattern', '')} »", objectName="desc"))
+
+        lb_sum = QLabel(_profile_overrides_summary(profile), objectName="hint")
+        lb_sum.setWordWrap(True)
+        cl.addWidget(lb_sum)
+        return card
+
+    @staticmethod
+    def _set_combo_data(combo: QComboBox, value):
+        """Sélectionne l'entrée dont currentData == value (sinon index 0)."""
+        pos = combo.findData(value)
+        combo.setCurrentIndex(pos if pos >= 0 else 0)
+
+    def _edit_profile(self, profile_id):
+        """Charge un profil dans le formulaire (passe en mode édition)."""
+        prof_mod = _profiles_module()
+        if prof_mod is None:
+            return
+        try:
+            by_id = {p["id"]: p for p in prof_mod.list_profiles()}
+        except Exception as e:
+            logger.warning(f"_edit_profile list: {e}")
+            return
+        p = by_id.get(profile_id)
+        if p is None:
+            return
+        self._editing_profile_id = profile_id
+        self.ed_prof_name.setText(p.get("name") or "")
+        self.ed_prof_pattern.setText(p.get("app_pattern") or "")
+        self._set_combo_data(self.cb_prof_lang, p.get("language"))
+        self._set_combo_data(self.cb_prof_model, p.get("model"))
+        self._set_combo_data(self.cb_prof_reformat, p.get("reformatting"))
+        self._set_combo_data(self.cb_prof_ai, p.get("ai_reformat"))
+        self._set_combo_data(self.cb_prof_translate, p.get("translate_to"))
+        self.btn_prof_add.setText("Enregistrer")
+
+    def _delete_profile(self, profile_id):
+        """Supprime un profil après confirmation, puis rafraîchit la liste."""
+        prof_mod = _profiles_module()
+        if prof_mod is None:
+            return
+        resp = QMessageBox.question(
+            self, "Supprimer le profil", "Supprimer ce profil ?"
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            prof_mod.remove_profile(profile_id)
+        except Exception as e:
+            logger.warning(f"remove_profile: {e}")
+        if self._editing_profile_id == profile_id:
+            self._reset_profile_form()
+        self._refresh_profiles_list()
+
+    def _on_add_profile(self):
+        """Ajoute (ou met à jour, en mode édition) un profil depuis le formulaire."""
+        prof_mod = _profiles_module()
+        if prof_mod is None:
+            return
+        pattern = self.ed_prof_pattern.text().strip()
+        if not pattern:
+            QMessageBox.warning(
+                self, "Profil",
+                "Indiquez un motif d'application (ex. « Code », « Mail »).",
+            )
+            return
+        fields = dict(
+            name=self.ed_prof_name.text().strip() or None,
+            language=self.cb_prof_lang.currentData(),
+            model=self.cb_prof_model.currentData(),
+            reformatting=self.cb_prof_reformat.currentData(),
+            ai_reformat=self.cb_prof_ai.currentData(),
+            translate_to=self.cb_prof_translate.currentData(),
+        )
+        try:
+            if self._editing_profile_id is None:
+                prof_mod.add_profile(app_pattern=pattern, **fields)
+            else:
+                prof_mod.update_profile(
+                    self._editing_profile_id, app_pattern=pattern, **fields
+                )
+        except Exception as e:
+            logger.warning(f"add/update_profile: {e}")
+            QMessageBox.warning(self, "Profil", f"Impossible d'enregistrer : {e}")
+            return
+        self._reset_profile_form()
+        self._refresh_profiles_list()
+
+    def _reset_profile_form(self):
+        """Réinitialise le formulaire (retour en mode ajout)."""
+        self._editing_profile_id = None
+        self.ed_prof_name.clear()
+        self.ed_prof_pattern.clear()
+        for combo in (self.cb_prof_lang, self.cb_prof_model,
+                      self.cb_prof_reformat, self.cb_prof_ai,
+                      self.cb_prof_translate):
+            combo.setCurrentIndex(0)
+        self.btn_prof_add.setText("+ Ajouter")
 
     # ── Onglet 5 : Licence ───────────────────────────────────────────────────
     def _build_license_tab(self) -> QWidget:

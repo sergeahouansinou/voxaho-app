@@ -274,6 +274,78 @@ class _ActivationWorker(QThread):
             self.success.emit()
 
 
+# ─── Dictée d'essai (enregistrement + transcription hors thread GUI) ──────────
+
+class _TrialDictationWorker(QThread):
+    """Enregistre ~N secondes puis transcrit, entièrement hors du thread GUI.
+
+    Le thread GUI ne doit JAMAIS geler : l'enregistrement (bloquant) ET la
+    transcription (chargement modèle + inférence) se font ici. Les résultats
+    remontent par signaux (queued connection, thread-safe).
+
+    100 % défensif : toute erreur (dépendance absente, modèle non prêt, aucun
+    son…) est émise via `error` — l'appelant affiche alors un message informatif
+    sans casser le wizard. N'a pas de parent (survit à la destruction du dialog,
+    référence anti-GC via _park_thread).
+    """
+
+    transcribing = pyqtSignal()      # audio capturé, transcription démarrée
+    finished_text = pyqtSignal(str)  # texte transcrit (éventuellement vide)
+    error = pyqtSignal(str)          # échec → essai indisponible
+
+    def __init__(self, *, model: str, language: str, beam_size: int,
+                 device=None, seconds: float = 3.0, parent=None):
+        super().__init__(parent)
+        self._model    = model
+        self._language = language
+        self._beam     = beam_size
+        self._device   = device
+        self._seconds  = seconds
+
+    def _record(self):
+        """Capture ~seconds d'audio float32 mono 16 kHz. Renvoie np.ndarray|None.
+
+        Utilise le Recorder du moteur si importable (respecte le device choisi),
+        sinon repli direct sur sounddevice.
+        """
+        import time
+        # Voie privilégiée : Recorder existant (même chemin que la dictée réelle).
+        try:
+            from core.recorder import Recorder
+            rec = Recorder(device=self._device)
+            rec.start()
+            time.sleep(self._seconds + 0.2)
+            return rec.stop()
+        except Exception as e:
+            logger.debug(f"Recorder indisponible, repli sounddevice : {e}")
+        # Repli : sounddevice direct.
+        import sounddevice as sd
+        import numpy as np
+        frames = int(16000 * self._seconds)
+        audio = sd.rec(frames, samplerate=16000, channels=1,
+                       dtype="float32", device=self._device)
+        sd.wait()
+        return np.asarray(audio, dtype="float32").flatten()
+
+    def run(self):
+        try:
+            audio = self._record()
+            if audio is None or len(audio) == 0:
+                self.finished_text.emit("")  # pas de son → texte vide (non bloquant)
+                return
+            self.transcribing.emit()
+            from core.transcriber import Transcriber
+            tr = Transcriber(
+                model=self._model, language=self._language,
+                reformatting=True, beam_size=self._beam,
+            )
+            text = tr.transcribe(audio)
+            self.finished_text.emit(text or "")
+        except Exception as e:
+            logger.debug(f"_TrialDictationWorker: {e}", exc_info=True)
+            self.error.emit(str(e))
+
+
 # ─── Wizard ───────────────────────────────────────────────────────────────────
 
 class SetupWizard(QDialog):
@@ -293,22 +365,53 @@ class SetupWizard(QDialog):
         self._save_config = save_config_fn
         self._downloader: ModelDownloader | None = None
         self._config_draft: dict = {
-            "language":     "fr",
-            "model":        "small",
-            "reformatting": True,
-            "first_run":    False,
-            "bar_x":        None,
-            "bar_y":        None,
+            "language":        "fr",
+            "model":           "small",
+            "reformatting":    True,
+            "first_run":       False,
+            "bar_x":           None,
+            "bar_y":           None,
             # Réglages vitesse (Phase 0) : cohérence avec les Préférences.
             # beam_size 1 = « Vitesse » ; input_device None = micro système.
-            "beam_size":    1,
-            "input_device": None,
+            "beam_size":       1,
+            "input_device":    None,
+            # Backend de calcul (Phase 3b) : issu de la reco matérielle
+            # ("auto"|"cpu"|"mlx"). "auto" retombe sur CPU si MLX absent.
+            "compute_backend": "auto",
+            # Reformatage par IA locale (Qwen) : préférence mémorisée seulement,
+            # le modèle (~1 Go) sera téléchargé plus tard depuis les Réglages.
+            "ai_reformat":     False,
         }
+        # Détection matérielle + recommandation de modèle (défensif : si le
+        # module core.hardware est absent ou échoue, on garde small par défaut).
+        self._hw: dict = {}
+        self._reco: dict | None = None
+        self._detect_hardware()
         self._mic_timer: QTimer | None = None
         self._mic_stream = None
         self._mic_samples = []
         self._mic_seconds_left = 0
+        # Worker de dictée d'essai (page Mic test), gardé référencé anti-GC.
+        self._trial_worker = None
         self._setup_ui()
+
+    # ── Détection matérielle ───────────────────────────────────────────────────
+
+    def _detect_hardware(self):
+        """Détecte le matériel et calcule la reco de modèle (100 % défensif).
+
+        Toute erreur (module absent, exception) → self._hw = {} et
+        self._reco = None : le wizard retombe alors sur son comportement
+        d'origine (modèle « small » par défaut).
+        """
+        try:
+            from core import hardware
+            self._hw = hardware.detect_hardware()
+            self._reco = hardware.recommend_model(self._hw)
+        except Exception as e:
+            logger.debug(f"Détection matérielle indisponible : {e}")
+            self._hw = {}
+            self._reco = None
 
     # ── Construction ──────────────────────────────────────────────────────────
 
@@ -532,7 +635,33 @@ class SetupWizard(QDialog):
         sub.setObjectName("subtitle")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(sub)
-        lay.addSpacing(28)
+        lay.addSpacing(18)
+
+        # ── Résumé matériel + recommandation ─────────────────────────────
+        # Affiché seulement si la détection a réussi ; sinon on saute cette
+        # carte et le comportement d'origine (small par défaut) est conservé.
+        if self._reco is not None:
+            hw_card = QFrame(); hw_card.setObjectName("card")
+            hc = QVBoxLayout(hw_card)
+            hc.setContentsMargins(16, 12, 16, 12); hc.setSpacing(4)
+            hw_head = QLabel("💻  Votre machine"); hw_head.setObjectName("permTitle")
+            hc.addWidget(hw_head)
+            try:
+                from core import hardware
+                specs = hardware.specs_summary(self._hw)
+            except Exception:
+                specs = ""
+            if specs:
+                specs_lbl = QLabel(specs); specs_lbl.setObjectName("subtitle")
+                hc.addWidget(specs_lbl)
+            reco_lbl = QLabel(f"Recommandé : {self._reco['model']}")
+            reco_lbl.setObjectName("statusOk")
+            hc.addWidget(reco_lbl)
+            reason_lbl = QLabel(self._reco.get("reason", ""))
+            reason_lbl.setObjectName("hint"); reason_lbl.setWordWrap(True)
+            hc.addWidget(reason_lbl)
+            lay.addWidget(hw_card)
+            lay.addSpacing(16)
 
         lbl_lang = QLabel("Langue de dictée"); lbl_lang.setObjectName("section")
         lay.addWidget(lbl_lang)
@@ -541,7 +670,7 @@ class SetupWizard(QDialog):
         for code, label in LANGS:
             self.lang_combo.addItem(label, code)
         lay.addWidget(self.lang_combo)
-        lay.addSpacing(20)
+        lay.addSpacing(16)
 
         lbl_model = QLabel("Modèle Whisper (précision / vitesse)")
         lbl_model.setObjectName("section")
@@ -558,16 +687,40 @@ class SetupWizard(QDialog):
         self.model_combo.addItem("medium          — Très précis",                       "medium")
         self.model_combo.addItem("large-v3-turbo  — Quasi-max, très rapide  ✓ Recommandé", "large-v3-turbo")
         self.model_combo.addItem("large-v3        — Meilleure qualité",                 "large-v3")
-        self.model_combo.setCurrentIndex(1)
+        # Pré-sélection du modèle recommandé (défaut small si pas de reco).
+        self._select_recommended_model()
         lay.addWidget(self.model_combo)
-        lay.addSpacing(20)
+        lay.addSpacing(4)
+
+        # Bouton discret pour re-sélectionner la reco (visible si reco dispo).
+        if self._reco is not None:
+            reco_row = QHBoxLayout()
+            reco_row.addStretch()
+            self._btn_use_reco = QPushButton("Utiliser la recommandation")
+            self._btn_use_reco.setObjectName("link")
+            self._btn_use_reco.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._btn_use_reco.clicked.connect(self._select_recommended_model)
+            reco_row.addWidget(self._btn_use_reco)
+            reco_row.addStretch()
+            lay.addLayout(reco_row)
+        lay.addSpacing(14)
 
         self.reform_check = QCheckBox(
             "Reformatage IA  (supprime 'euh', ponctuation automatique)"
         )
         self.reform_check.setChecked(True)
         lay.addWidget(self.reform_check)
-        lay.addSpacing(16)
+        lay.addSpacing(10)
+
+        # Option informative : reformatage par IA locale (Qwen). NE déclenche
+        # AUCUN téléchargement ici — on mémorise seulement la préférence
+        # (ai_reformat) ; le modèle (~1 Go) se télécharge depuis les Réglages.
+        self.ai_reform_check = QCheckBox(
+            "Reformatage par IA locale (Qwen, ~1 Go) — télécharger plus tard dans les Réglages"
+        )
+        self.ai_reform_check.setChecked(bool(self._config_draft.get("ai_reformat", False)))
+        lay.addWidget(self.ai_reform_check)
+        lay.addSpacing(14)
 
         self._win_key_combo = None
         if not IS_MAC:
@@ -588,6 +741,19 @@ class SetupWizard(QDialog):
 
         lay.addStretch()
         return page
+
+    def _select_recommended_model(self):
+        """(Ré)aligne le combo modèle sur la recommandation matérielle.
+
+        Sans reco (détection indisponible) → défaut « small » (comportement
+        d'origine). Défensif : si le code recommandé n'est pas dans le combo,
+        on retombe sur small.
+        """
+        target = self._reco.get("model") if self._reco else "small"
+        idx = self.model_combo.findData(target)
+        if idx < 0:
+            idx = self.model_combo.findData("small")
+        self.model_combo.setCurrentIndex(idx if idx >= 0 else 1)
 
     def _build_download(self) -> QWidget:
         page, lay = self._page_widget()
@@ -626,13 +792,23 @@ class SetupWizard(QDialog):
         title.setFont(QFont("-apple-system", 22, QFont.Weight.Bold))
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(title)
-        lay.addSpacing(8)
+        lay.addSpacing(6)
 
-        sub = QLabel("Cliquez sur Commencer puis parlez 3 secondes")
+        sub = QLabel("Choisissez un micro, testez le niveau, puis dictez pour de vrai")
         sub.setObjectName("subtitle")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setWordWrap(True)
         lay.addWidget(sub)
-        lay.addSpacing(30)
+        lay.addSpacing(16)
+
+        # ── Sélection du micro ────────────────────────────────────────────
+        lbl_mic = QLabel("Microphone"); lbl_mic.setObjectName("section")
+        lay.addWidget(lbl_mic)
+        lay.addSpacing(6)
+        self._mic_combo = QComboBox()
+        self._populate_mic_combo()
+        lay.addWidget(self._mic_combo)
+        lay.addSpacing(16)
 
         meter_row = QHBoxLayout()
         meter_row.addStretch()
@@ -643,13 +819,13 @@ class SetupWizard(QDialog):
         meter_row.addWidget(self._vu)
         meter_row.addStretch()
         lay.addLayout(meter_row)
-        lay.addSpacing(20)
+        lay.addSpacing(12)
 
         self._mic_result = QLabel("")
         self._mic_result.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._mic_result.setObjectName("subtitle")
         lay.addWidget(self._mic_result)
-        lay.addSpacing(20)
+        lay.addSpacing(14)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -658,11 +834,76 @@ class SetupWizard(QDialog):
         self._btn_mic.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_mic.clicked.connect(self._start_mic_test)
         btn_row.addWidget(self._btn_mic)
+
+        # Dictée d'essai réelle (bonus, best-effort). Enregistre ~3 s, transcrit
+        # dans un QThread (jamais sur le thread GUI) et affiche le texte obtenu.
+        self._btn_trial = QPushButton("Faire une dictée d'essai")
+        self._btn_trial.setObjectName("ghost")
+        self._btn_trial.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_trial.clicked.connect(self._start_trial_dictation)
+        btn_row.addWidget(self._btn_trial)
         btn_row.addStretch()
         lay.addLayout(btn_row)
+        lay.addSpacing(12)
+
+        self._trial_field = QLineEdit()
+        self._trial_field.setReadOnly(True)
+        self._trial_field.setPlaceholderText("Le texte de votre dictée d'essai apparaîtra ici")
+        lay.addWidget(self._trial_field)
+        lay.addSpacing(4)
+
+        self._trial_status = QLabel("")
+        self._trial_status.setObjectName("hint")
+        self._trial_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._trial_status.setWordWrap(True)
+        lay.addWidget(self._trial_status)
 
         lay.addStretch()
         return page
+
+    def _populate_mic_combo(self):
+        """Peuple le combo de micros (défensif : agent moteur peut être absent).
+
+        1ʳᵉ entrée « Micro système par défaut » = None (currentData), puis chaque
+        périphérique d'entrée (index sounddevice en currentData). Si le helper
+        est indisponible ou renvoie une liste vide, seule l'entrée par défaut
+        reste et le combo est désactivé.
+        """
+        self._mic_combo.clear()
+        self._mic_combo.addItem("Micro système par défaut", None)
+        devices = []
+        try:
+            from core.recorder import list_input_devices
+            devices = list_input_devices() or []
+        except Exception as e:  # ImportError, erreur PortAudio, etc.
+            logger.debug(f"list_input_devices indisponible : {e}")
+            devices = []
+        if devices:
+            self._mic_combo.setEnabled(True)
+            for dev in devices:
+                try:
+                    idx = int(dev["index"])
+                    name = str(dev.get("name", f"Périphérique {idx}"))
+                    is_default = bool(dev.get("default", False))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                label = f"{name}  ✓ défaut système" if is_default else name
+                self._mic_combo.addItem(label, idx)
+        else:
+            self._mic_combo.setEnabled(False)
+        # Restaure la préférence éventuelle du brouillon.
+        current = self._config_draft.get("input_device")
+        if current is not None:
+            pos = self._mic_combo.findData(current)
+            if pos >= 0:
+                self._mic_combo.setCurrentIndex(pos)
+
+    def _selected_input_device(self):
+        """Index du micro sélectionné dans le wizard, ou None (défaut système)."""
+        combo = getattr(self, "_mic_combo", None)
+        if combo is None:
+            return None
+        return combo.currentData()
 
     def _build_tutorial(self) -> QWidget:
         page, lay = self._page_widget()
@@ -811,8 +1052,19 @@ class SetupWizard(QDialog):
             self._config_draft["language"]     = self.lang_combo.currentData()
             self._config_draft["model"]        = self.model_combo.currentData()
             self._config_draft["reformatting"] = self.reform_check.isChecked()
+            self._config_draft["ai_reformat"]  = self.ai_reform_check.isChecked()
+            # beam_size + compute_backend proviennent de la reco matérielle
+            # (défauts déjà présents dans _config_draft si pas de reco).
+            if self._reco is not None:
+                self._config_draft["beam_size"]       = int(self._reco.get("beam_size", 1))
+                self._config_draft["compute_backend"] = self._reco.get("compute_backend", "auto")
             if self._win_key_combo is not None:
                 self._config_draft["win_key"] = self._win_key_combo.currentData()
+        if cur == 4:
+            # Snapshot du micro choisi (page Mic test) : index périphérique
+            # sounddevice ou None (« Micro système par défaut »).
+            if getattr(self, "_mic_combo", None) is not None:
+                self._config_draft["input_device"] = self._mic_combo.currentData()
         if cur == 6:
             # Save and accept
             self._save_config(self._config_draft)
@@ -959,7 +1211,7 @@ class SetupWizard(QDialog):
         try:
             self._mic_stream = sd.InputStream(
                 channels=1, samplerate=16000, blocksize=512, callback=cb,
-                dtype="float32",
+                dtype="float32", device=self._selected_input_device(),
             )
             self._mic_stream.start()
         except Exception as e:
@@ -1004,6 +1256,73 @@ class SetupWizard(QDialog):
             db = 20 * math.log10(max(avg, 1e-6))
             self._mic_result.setText(f"✓ Micro OK · niveau moyen {db:.0f} dB")
 
+    # ── Dictée d'essai réelle (bonus, best-effort) ────────────────────────────
+
+    def _start_trial_dictation(self):
+        """Lance une courte dictée d'essai : ~3 s d'audio → transcription.
+
+        100 % DÉFENSIF ET OPTIONNEL. L'enregistrement ET la transcription
+        tournent dans un QThread (_TrialDictationWorker) : le thread GUI n'est
+        JAMAIS bloqué. Tout échec (modèle non prêt, dépendance absente, aucun
+        son…) affiche un message informatif sans casser le wizard.
+        """
+        # Un test de niveau en cours ? On l'arrête d'abord (partage du micro).
+        if self._mic_stream is not None:
+            self._stop_mic_test()
+        # Déjà une dictée d'essai en cours ?
+        if self._trial_worker is not None and self._trial_worker.isRunning():
+            return
+
+        self._btn_trial.setEnabled(False)
+        self._btn_trial.setText("Écoutez… parlez !")
+        self._trial_field.clear()
+        self._trial_status.setText("Enregistrement de 3 secondes…")
+
+        model    = self._config_draft.get("model", "small")
+        language = self._config_draft.get("language", "fr")
+        beam     = int(self._config_draft.get("beam_size", 1))
+        device   = self._selected_input_device()
+
+        worker = _TrialDictationWorker(
+            model=model, language=language, beam_size=beam,
+            device=device, seconds=3.0,
+        )
+        self._trial_worker = worker
+        _park_thread(worker)
+        worker.transcribing.connect(self._on_trial_transcribing)
+        worker.finished_text.connect(self._on_trial_done)
+        worker.error.connect(self._on_trial_error)
+        worker.start()
+
+    def _on_trial_transcribing(self):
+        # Slot sur le thread GUI (queued connection).
+        self._trial_status.setText("Transcription en cours…")
+
+    def _on_trial_done(self, text: str):
+        # Slot sur le thread GUI (queued connection).
+        self._btn_trial.setEnabled(True)
+        self._btn_trial.setText("Refaire une dictée d'essai")
+        text = (text or "").strip()
+        if text:
+            self._trial_field.setText(text)
+            self._trial_status.setText("✓ Voilà ce que Voxaho a compris.")
+        else:
+            self._trial_field.clear()
+            self._trial_status.setText(
+                "Aucun texte détecté — parlez un peu plus fort, puis réessayez."
+            )
+
+    def _on_trial_error(self, msg: str):
+        # Slot sur le thread GUI (queued connection). L'essai est un bonus :
+        # on n'affiche jamais d'erreur bloquante, juste une note rassurante.
+        logger.debug(f"Dictée d'essai indisponible : {msg}")
+        self._btn_trial.setEnabled(True)
+        self._btn_trial.setText("Faire une dictée d'essai")
+        self._trial_field.clear()
+        self._trial_status.setText(
+            "Essai indisponible, vous pourrez dicter après configuration."
+        )
+
     # ── Final ────────────────────────────────────────────────────────────────
 
     def _finalize_config_text(self):
@@ -1045,6 +1364,19 @@ class SetupWizard(QDialog):
                     pass
             _park_thread(self._downloader)
             self._downloader = None
+        # Dictée d'essai en cours : même traitement anti-GC (déconnexion des
+        # signaux + parking). Le worker n'a pas de parent et mourra avec le
+        # process ; on évite ainsi le crash "QThread: Destroyed while running".
+        if self._trial_worker is not None and self._trial_worker.isRunning():
+            for sig in (self._trial_worker.transcribing,
+                        self._trial_worker.finished_text,
+                        self._trial_worker.error):
+                try:
+                    sig.disconnect()
+                except TypeError:
+                    pass
+            _park_thread(self._trial_worker)
+            self._trial_worker = None
         super().closeEvent(event)
 
 
