@@ -473,14 +473,18 @@ class SettingsWindow(QDialog):
         right_lay.setSpacing(16)
 
         self.stack = QStackedWidget()
-        self.stack.addWidget(self._build_general_tab())
-        self.stack.addWidget(self._build_model_tab())
-        self.stack.addWidget(self._build_mic_tab())
-        self.stack.addWidget(self._build_hotkey_tab())
-        self.stack.addWidget(self._build_appearance_tab())
-        self.stack.addWidget(self._build_profiles_tab())
-        self.stack.addWidget(self._build_license_tab())
-        self.stack.addWidget(self._build_about_tab())
+        # Chaque onglet est enveloppé dans une zone défilante : la fenêtre est de
+        # taille fixe et certains onglets (Général = 5 sections, Profils) ont plus
+        # de contenu que la hauteur disponible. Sans défilement, le contenu était
+        # comprimé → combos écrasés (texte invisible) et hints qui se chevauchent.
+        self.stack.addWidget(self._scrollable(self._build_general_tab()))
+        self.stack.addWidget(self._scrollable(self._build_model_tab()))
+        self.stack.addWidget(self._scrollable(self._build_mic_tab()))
+        self.stack.addWidget(self._scrollable(self._build_hotkey_tab()))
+        self.stack.addWidget(self._scrollable(self._build_appearance_tab()))
+        self.stack.addWidget(self._scrollable(self._build_profiles_tab()))
+        self.stack.addWidget(self._scrollable(self._build_license_tab()))
+        self.stack.addWidget(self._scrollable(self._build_about_tab()))
         right_lay.addWidget(self.stack, 1)
 
         # Boutons bas
@@ -517,6 +521,22 @@ class SettingsWindow(QDialog):
             lay.addWidget(s)
         lay.addSpacing(6)
         return w, lay
+
+    def _scrollable(self, content: QWidget) -> QScrollArea:
+        """Enveloppe le contenu d'un onglet dans une zone défilante verticale.
+
+        Évite que le contenu soit comprimé quand il dépasse la hauteur fixe de
+        la fenêtre (combos écrasés, hints qui se chevauchent). Transparent et
+        sans cadre (le QSS QScrollArea est déjà neutre).
+        """
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        area.viewport().setStyleSheet("background: transparent;")
+        area.setWidget(content)
+        return area
 
     def _section_label(self, text: str) -> QLabel:
         return QLabel(text, objectName="section")

@@ -59,6 +59,12 @@ def main():
 
     from PyQt6.QtWidgets import QApplication
     app = QApplication(sys.argv)
+    # Style Fusion : le style natif macOS (QMacStyle) ne peint pas le texte
+    # courant d'un QComboBox quand une feuille de style personnalisée est
+    # appliquée → les menus déroulants (langue, traduction, modèle…) apparaissent
+    # vides. Fusion rend les combos correctement et garde notre QSS (toggles,
+    # couleurs) identique sur macOS / Windows / Linux.
+    app.setStyle("Fusion")
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Voxaho")
 
