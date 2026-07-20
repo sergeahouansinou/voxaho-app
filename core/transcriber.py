@@ -21,6 +21,11 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Sentinelle interne : distingue « ne pas toucher » de « mettre à None » dans
+# update_settings(). Indispensable pour translate_to, dont None est une valeur
+# VALIDE (« pas de traduction ») et non « paramètre omis ».
+_UNSET = object()
+
 # Sons d'hésitation par langue. UNIQUEMENT des sons purs, jamais de vrais mots :
 # tout terme pouvant être un mot légitime de la langue (ex. "like" en anglais,
 # "quoi"/"ben" en français, "um" en allemand, "eh"/"este" en espagnol) est
@@ -172,7 +177,7 @@ class Transcriber:
     def __init__(self, model: str = "small", language: str = "fr",
                  reformatting: bool = True, beam_size: int = 1,
                  backend: str = "auto", postprocess: bool = True,
-                 ai_reformat: bool = False):
+                 ai_reformat: bool = False, translate_to: str | None = None):
         self.model_name   = model
         self.language     = None if language == "auto" else language
         self.reformatting = reformatting
@@ -186,6 +191,10 @@ class Transcriber:
         # le nettoyage par règles ; sinon repli automatique sur les règles.
         # Ajouté en dernier param → n'invalide aucun appel existant.
         self.ai_reformat  = ai_reformat
+        # Traduction à la volée (Phase 3) : code langue CIBLE, ou None = pas de
+        # traduction. Appliquée EN AVAL de tout le pipeline (voir transcribe()).
+        # Ajouté en DERNIER param → n'invalide aucun appel existant.
+        self.translate_to = translate_to
         self._model       = None
         self._model_lock  = threading.Lock()
 
@@ -234,13 +243,20 @@ class Transcriber:
     def update_settings(self, beam_size: int | None = None,
                         language: str | None = None,
                         reformatting: bool | None = None,
-                        ai_reformat: bool | None = None):
-        """Met à jour à chaud beam_size / language / reformatting / ai_reformat
-        (thread-safe).
+                        ai_reformat: bool | None = None,
+                        translate_to=_UNSET):
+        """Met à jour à chaud beam_size / language / reformatting / ai_reformat /
+        translate_to (thread-safe).
 
         Les paramètres laissés à None ne sont pas modifiés. Ne recharge PAS le
         modèle (contrairement à update_model) : ces réglages sont lus à chaque
         transcription. Les attributs restent aussi modifiables directement.
+
+        CAS PARTICULIER translate_to : None est une valeur VALIDE (« désactiver la
+        traduction »), donc on ne peut pas s'en servir comme « ne pas toucher ». On
+        utilise la sentinelle interne `_UNSET` : tant que translate_to vaut _UNSET,
+        l'attribut n'est PAS modifié ; toute autre valeur (y compris None) est
+        appliquée telle quelle.
         """
         with self._model_lock:
             if beam_size is not None:
@@ -251,6 +267,8 @@ class Transcriber:
                 self.reformatting = reformatting
             if ai_reformat is not None:
                 self.ai_reformat = ai_reformat
+            if translate_to is not _UNSET:
+                self.translate_to = translate_to
 
     def preload(self):
         """Charge le modèle ET fait un warmup (transcrit ~0.5 s de silence) pour
@@ -325,6 +343,12 @@ class Transcriber:
         # snippets. Défensif (voir _apply_postprocessing).
         if self.postprocess and text:
             text = self._apply_postprocessing(text)
+
+        # Traduction à la volée (Phase 3), TOUT À LA FIN : on traduit un texte déjà
+        # propre (reformaté + post-traité). Le garde ci-dessous assure translate_to
+        # None/absent → AUCUN appel, AUCUN import (comportement d'origine intact).
+        if text and isinstance(self.translate_to, str) and self.translate_to:
+            text = self._translate_text(text, detected_lang)
 
         return text
 
@@ -521,4 +545,34 @@ class Transcriber:
         for i, url in enumerate(urls):
             text = text.replace(placeholder.format(i=i), url)
 
+        return text
+
+    # ── Traduction à la volée ───────────────────────────────────────────────────
+
+    def _translate_text(self, text: str, source_lang: str | None) -> str:
+        """Traduit `text` vers `self.translate_to` via le LLM local (core.translator).
+
+        Import différé + défensif : module absent (agent parallèle non livré) ou
+        toute erreur → texte ORIGINAL conservé (repli silencieux, log debug).
+
+        Sortie de translator.translate() :
+          - chaîne NON vide → on l'utilise (texte traduit) ;
+          - None ou chaîne vide (cible inconnue, LLM indispo, garde-fou…) → on
+            garde le texte original.
+
+        Appelé uniquement quand self.translate_to est une chaîne non vide (garde
+        situé dans transcribe()) : translate_to=None → cette méthode n'est jamais
+        atteinte, donc aucun import de core.translator.
+        """
+        try:
+            from core import translator
+            out = translator.translate(
+                text, target_lang=self.translate_to, source_lang=source_lang
+            )
+        except Exception as e:  # pragma: no cover - purement défensif
+            logger.debug("Traduction indisponible → texte original conservé: %s", e)
+            return text
+        if isinstance(out, str) and out.strip():
+            return out
+        logger.debug("Traduction vide/indisponible → texte original conservé.")
         return text

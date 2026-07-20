@@ -7,7 +7,7 @@ séparateur, et bas de sidebar avec « Réglages ». La zone de droite est un
 QStackedWidget dont la page change selon la sélection de la sidebar.
 
 Sections : Accueil (dashboard), Historique, Notes, Dictionnaire, Snippets,
-Statistiques.
+Statistiques, Réunion (transcription continue horodatée — PHASE 3).
 
 La couche données (core.history / core.notes / core.stats / core.dictionary /
 core.snippets) est fournie par un agent parallèle : TOUS les accès sont
@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QPushButton, QListWidget, QListWidgetItem, QStackedWidget, QLineEdit,
     QTextEdit, QScrollArea, QFrame, QCheckBox, QMessageBox, QApplication,
-    QSizePolicy,
+    QSizePolicy, QFileDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QEvent, QRectF
 from PyQt6.QtGui import QPainter, QColor
@@ -318,15 +318,22 @@ class WorkspaceWindow(QMainWindow):
     # connecté à refresh() pour recharger la page courante en direct.
     dictation_added = pyqtSignal()
 
+    # Émis (depuis le callback on_segment de MeetingSession, potentiellement sur
+    # un thread worker) à chaque nouveau segment de réunion. Passer par un signal
+    # Qt garantit une remontée THREAD-SAFE vers le slot qui append au transcript.
+    meeting_segment = pyqtSignal(dict)
+
     # Index des pages dans le QStackedWidget (aligné sur l'ordre de la nav).
     # Dictionnaire et Snippets sont insérés après Notes et avant Statistiques :
-    # cela décale l'index de Statistiques (3 → 5), d'où la mise à jour ici.
+    # cela décale l'index de Statistiques (3 → 5). La page Réunion est ajoutée EN
+    # DERNIER (index 6), ce qui laisse les index existants inchangés.
     PAGE_HOME = 0
     PAGE_HISTORY = 1
     PAGE_NOTES = 2
     PAGE_DICTIONARY = 3
     PAGE_SNIPPETS = 4
     PAGE_STATS = 5
+    PAGE_MEETING = 6
 
     def __init__(self, config: dict, save_config_fn, open_settings_fn=None):
         super().__init__()
@@ -343,8 +350,16 @@ class WorkspaceWindow(QMainWindow):
         # État Snippets : id du snippet en cours d'édition (None = mode ajout).
         self._editing_snippet_id = None
 
+        # État Réunion : session en cours (core.meeting.MeetingSession) + segments
+        # accumulés (pour l'export / l'enregistrement en note). Anti-GC : la
+        # session est gardée comme attribut d'instance tant qu'elle tourne.
+        self._meeting_session = None
+        self._meeting_segments: list[dict] = []
+
         self._setup_ui()
         self.dictation_added.connect(self.refresh)
+        # Remontée thread-safe des segments live vers le slot d'affichage.
+        self.meeting_segment.connect(self._on_meeting_segment)
 
     # ── Construction de l'UI ─────────────────────────────────────────────────
     def _setup_ui(self):
@@ -376,6 +391,7 @@ class WorkspaceWindow(QMainWindow):
         self.stack.addWidget(self._build_dictionary_page())   # 3
         self.stack.addWidget(self._build_snippets_page())     # 4
         self.stack.addWidget(self._build_stats_page())        # 5
+        self.stack.addWidget(self._build_meeting_page())      # 6
         content_lay.addWidget(self.stack, 1)
         root.addWidget(content, 1)
 
@@ -406,17 +422,21 @@ class WorkspaceWindow(QMainWindow):
         # Navigation principale.
         self.nav = QListWidget(objectName="nav")
         self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # AsNeeded : si la fenêtre est trop courte pour les 7 sections, on défile
+        # au lieu de couper les derniers items (Statistiques / Réunion).
+        self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.nav.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # Ordre synchronisé avec l'ajout des pages au QStackedWidget (_setup_ui).
         for label in ["🏠  Accueil", "🕘  Historique", "📝  Notes",
-                      "📖  Dictionnaire", "⚡  Snippets", "📊  Statistiques"]:
+                      "📖  Dictionnaire", "⚡  Snippets", "📊  Statistiques",
+                      "🎤  Réunion"]:
             it = QListWidgetItem(label)
             it.setSizeHint(QSize(0, 42))
             self.nav.addItem(it)
-        lay.addWidget(self.nav)
-
-        lay.addStretch(1)
+        # Facteur d'étirement 1 : la liste remplit toute la hauteur disponible
+        # entre le header et « Réglages » → les 7 sections sont visibles (avant,
+        # sans stretch, la liste gardait sa hauteur par défaut et coupait la fin).
+        lay.addWidget(self.nav, 1)
 
         # Séparateur + bas de sidebar : « Réglages ».
         sep = QFrame(objectName="sep")
@@ -1134,6 +1154,204 @@ class WorkspaceWindow(QMainWindow):
             parts.append(f"Première utilisation : {format_iso_datetime(first)}")
         self._stats_footer.setText("     ·     ".join(parts))
 
+    # ── Page 7 : Réunion (transcription continue horodatée) ───────────────────
+    def _build_meeting_page(self) -> QWidget:
+        w, lay = self._page(
+            "Réunion",
+            "Transcription continue, horodatée et 100 % locale — idéale pour vos "
+            "réunions et prises de notes longues")
+
+        # Barre d'action : bouton démarrer/arrêter + libellé d'état.
+        # Anti-GC : conservés comme attributs d'instance.
+        controls = QHBoxLayout()
+        controls.setSpacing(10)
+        self.meeting_btn = QPushButton("●  Démarrer la réunion", objectName="primary")
+        self.meeting_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.meeting_btn.clicked.connect(self._on_toggle_meeting)
+        controls.addWidget(self.meeting_btn)
+        self.meeting_status = QLabel("", objectName="desc")
+        controls.addWidget(self.meeting_status, 1)
+        lay.addLayout(controls)
+
+        # Message d'erreur (module/micro indisponible) — masqué par défaut.
+        self.meeting_error = QLabel("", objectName="empty")
+        self.meeting_error.setWordWrap(True)
+        self.meeting_error.setVisible(False)
+        lay.addWidget(self.meeting_error)
+
+        # Zone de transcript live défilante (lecture seule ; auto-scroll à l'ajout).
+        self.meeting_transcript = QTextEdit()
+        self.meeting_transcript.setReadOnly(True)
+        self.meeting_transcript.setPlaceholderText(
+            "Le transcript s'affichera ici, horodaté, au fil de la réunion…")
+        lay.addWidget(self.meeting_transcript, 1)
+
+        # Actions de fin : export Markdown + enregistrement en note (désactivées
+        # tant qu'il n'y a pas de contenu à exporter).
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        self.meeting_export_btn = QPushButton("Exporter en Markdown", objectName="ghost")
+        self.meeting_export_btn.clicked.connect(self._export_meeting_markdown)
+        self.meeting_export_btn.setEnabled(False)
+        actions.addWidget(self.meeting_export_btn)
+        self.meeting_note_btn = QPushButton("Enregistrer comme note", objectName="primary")
+        self.meeting_note_btn.clicked.connect(self._save_meeting_as_note)
+        self.meeting_note_btn.setEnabled(False)
+        actions.addWidget(self.meeting_note_btn)
+        lay.addLayout(actions)
+
+        return w
+
+    def _meeting_available(self) -> tuple[bool, str]:
+        """Vérifie que le moteur Réunion et ses dépendances sont disponibles.
+
+        Retourne (ok, message). Défensif : ne lève jamais. Contrôle la présence
+        du module core.meeting, de sounddevice (capture) et de faster-whisper
+        (transcription) sans les charger réellement.
+        """
+        if _mod("meeting") is None:
+            return False, "Le mode Réunion est indisponible (module manquant)."
+        import importlib.util
+        try:
+            if importlib.util.find_spec("sounddevice") is None:
+                return False, "Micro indisponible : le module « sounddevice » n'est pas installé."
+            if importlib.util.find_spec("faster_whisper") is None:
+                return False, "Transcription indisponible : « faster-whisper » n'est pas installé."
+        except Exception as e:
+            return False, f"Mode Réunion indisponible : {e}"
+        return True, ""
+
+    def _refresh_meeting(self):
+        """Réaligne l'état de la page Réunion (bouton, message d'erreur).
+
+        N'interrompt jamais une session en cours (navigation aller/retour) : si la
+        réunion tourne, on conserve simplement l'état « Arrêter ».
+        """
+        running = self._meeting_session is not None and self._meeting_session.is_running()
+        if running:
+            self.meeting_error.setVisible(False)
+            self.meeting_btn.setEnabled(True)
+            self.meeting_btn.setText("■  Arrêter")
+            self.meeting_status.setText("● Enregistrement en cours…")
+            return
+
+        self.meeting_btn.setText("●  Démarrer la réunion")
+        self.meeting_status.setText("")
+        ok, msg = self._meeting_available()
+        self.meeting_btn.setEnabled(ok)
+        self.meeting_error.setText("" if ok else msg)
+        self.meeting_error.setVisible(not ok)
+        has = bool(self._meeting_segments)
+        self.meeting_export_btn.setEnabled(has)
+        self.meeting_note_btn.setEnabled(has)
+
+    def _on_toggle_meeting(self):
+        if self._meeting_session is not None and self._meeting_session.is_running():
+            self._stop_meeting()
+        else:
+            self._start_meeting()
+
+    def _start_meeting(self):
+        ok, msg = self._meeting_available()
+        if not ok:
+            self._show_meeting_error(msg)
+            return
+        try:
+            from core.meeting import MeetingSession
+        except Exception as e:
+            self._show_meeting_error(f"Le mode Réunion est indisponible : {e}")
+            return
+
+        # Réinitialise l'affichage et l'accumulateur de segments.
+        self._meeting_segments = []
+        self.meeting_transcript.clear()
+        self.meeting_export_btn.setEnabled(False)
+        self.meeting_note_btn.setEnabled(False)
+
+        try:
+            self._meeting_session = MeetingSession()
+            # Le callback émet un signal Qt → remontée thread-safe vers le slot.
+            self._meeting_session.start(on_segment=self.meeting_segment.emit)
+        except Exception as e:  # MeetingError (micro indispo) ou toute autre erreur
+            self._meeting_session = None
+            self._show_meeting_error(f"Impossible de démarrer la capture audio : {e}")
+            return
+
+        self.meeting_error.setVisible(False)
+        self.meeting_btn.setText("■  Arrêter")
+        self.meeting_status.setText("● Enregistrement en cours…")
+
+    def _stop_meeting(self):
+        session = self._meeting_session
+        self._meeting_session = None
+        if session is not None:
+            try:
+                # La liste retournée fait foi (complète, ordonnée, inclut le flush final).
+                segments = session.stop()
+                if segments is not None:
+                    self._meeting_segments = segments
+            except Exception as e:
+                logger.warning("Réunion : arrêt de la session : %s", e)
+
+        self.meeting_btn.setText("●  Démarrer la réunion")
+        self.meeting_status.setText("Réunion terminée." if self._meeting_segments else "")
+        has = bool(self._meeting_segments)
+        self.meeting_export_btn.setEnabled(has)
+        self.meeting_note_btn.setEnabled(has)
+
+    def _on_meeting_segment(self, segment: dict):
+        """Slot connecté à meeting_segment : append un segment au transcript live."""
+        try:
+            self._meeting_segments.append(segment)
+            ts = segment.get("timestamp", "")
+            text = str(segment.get("text", "")).strip()
+            self.meeting_transcript.append(f"[{ts}]  {text}")
+        except Exception as e:  # jamais crasher l'UI sur un segment
+            logger.warning("Réunion : affichage d'un segment : %s", e)
+
+    def _export_meeting_markdown(self):
+        if not self._meeting_segments:
+            return
+        try:
+            from core.meeting import export_markdown
+            md = export_markdown(self._meeting_segments)
+        except Exception as e:
+            QMessageBox.warning(self, "Réunion", f"Export impossible : {e}")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exporter la réunion", "reunion.md", "Markdown (*.md)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(md)
+        except OSError as e:
+            QMessageBox.warning(self, "Réunion", f"Écriture impossible : {e}")
+
+    def _save_meeting_as_note(self):
+        if not self._meeting_segments:
+            return
+        try:
+            from core.meeting import merge_segments
+            body = merge_segments(self._meeting_segments)
+        except Exception as e:
+            logger.warning("Réunion : fusion des segments : %s", e)
+            body = ""
+        title = f"Réunion du {format_iso_datetime(datetime.now().isoformat())}"
+        new_id = self._safe_call("notes", "create_note", default=None, _args=(title, body))
+        if new_id is None:
+            QMessageBox.warning(
+                self, "Réunion",
+                "Impossible d'enregistrer la note (module indisponible).")
+            return
+        QMessageBox.information(self, "Réunion", "Réunion enregistrée dans vos notes.")
+
+    def _show_meeting_error(self, message: str):
+        self.meeting_error.setText(message)
+        self.meeting_error.setVisible(True)
+        self.meeting_btn.setText("●  Démarrer la réunion")
+        self.meeting_status.setText("")
+
     # ── Rafraîchissement / navigation ─────────────────────────────────────────
     def refresh(self):
         """Recharge la page courante (appelée par l'intégration via dictation_added)."""
@@ -1151,6 +1369,8 @@ class WorkspaceWindow(QMainWindow):
                 self._refresh_snippets()
             elif idx == self.PAGE_STATS:
                 self._refresh_stats()
+            elif idx == self.PAGE_MEETING:
+                self._refresh_meeting()
         except Exception as e:  # jamais crasher la fenêtre sur un refresh
             logger.warning("refresh(page=%s) : %s", idx, e)
 

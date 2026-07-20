@@ -23,6 +23,7 @@ DEFAULT_CONFIG = {
     "beam_size":       1,          # faster-whisper beam search (1 = greedy, le plus rapide)
     "compute_backend": "auto",     # "auto" | "cpu" | "mlx" (fixé au constructeur du Transcriber)
     "ai_reformat":     False,      # reformatage IA local via LLM (retombe sur les règles si LLM absent)
+    "translate_to":    None,       # traduction à la volée : code langue cible (None = pas de traduction)
 }
 
 
@@ -58,6 +59,12 @@ def main():
 
     from PyQt6.QtWidgets import QApplication
     app = QApplication(sys.argv)
+    # Style Fusion : le style natif macOS (QMacStyle) ne peint pas le texte
+    # courant d'un QComboBox quand une feuille de style personnalisée est
+    # appliquée → les menus déroulants (langue, traduction, modèle…) apparaissent
+    # vides. Fusion rend les combos correctement et garde notre QSS (toggles,
+    # couleurs) identique sur macOS / Windows / Linux.
+    app.setStyle("Fusion")
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Voxaho")
 

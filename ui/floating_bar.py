@@ -325,12 +325,17 @@ class FloatingBar(QWidget):
         self._launch_preload()
 
     def _build_transcriber(self):
-        """Instancie un Transcriber avec la config courante (beam_size + backend + ai_reformat).
+        """Instancie un Transcriber avec la config courante (beam_size + backend
+        + ai_reformat + translate_to).
 
-        Défensif : si le constructeur de l'agent moteur ne connaît pas encore les
-        kwargs `beam_size`/`backend`/`ai_reformat` (ordre d'arrivée des agents
-        parallèles), on retombe sur la signature minimale. Transitoire — à retirer
-        une fois le contrat moteur stabilisé.
+        Défensif, par repli progressif : si le constructeur de l'agent moteur ne
+        connaît pas encore certains kwargs récents (ordre d'arrivée des agents
+        parallèles), on retombe d'un cran à la fois plutôt que de perdre d'un coup
+        tous les réglages récents :
+          1. tout (dont translate_to, le plus récent) ;
+          2. sans translate_to (moteur pas encore doté de la traduction) ;
+          3. signature minimale (contrat moteur historique).
+        Transitoire — à retirer une fois le contrat moteur stabilisé.
         """
         from core.transcriber import Transcriber
         model        = self.config.get("model",           "small")
@@ -339,6 +344,19 @@ class FloatingBar(QWidget):
         beam_size    = self.config.get("beam_size",       1)
         backend      = self.config.get("compute_backend", "auto")
         ai_reformat  = self.config.get("ai_reformat",     False)
+        translate_to = self.config.get("translate_to",    None)
+        try:
+            return Transcriber(
+                model        = model,
+                language     = language,
+                reformatting = reformatting,
+                beam_size    = beam_size,
+                backend      = backend,
+                ai_reformat  = ai_reformat,
+                translate_to = translate_to,
+            )
+        except TypeError:
+            pass  # transitoire : moteur pas encore doté du kwarg translate_to
         try:
             return Transcriber(
                 model        = model,
@@ -350,7 +368,7 @@ class FloatingBar(QWidget):
             )
         except TypeError:
             # Transitoire : constructeur moteur pas encore à jour → sans kwargs.
-            logger.warning("Transcriber sans kwargs beam_size/backend/ai_reformat (contrat moteur transitoire)")
+            logger.warning("Transcriber sans kwargs beam_size/backend/ai_reformat/translate_to (contrat moteur transitoire)")
             return Transcriber(
                 model        = model,
                 language     = language,
@@ -399,6 +417,91 @@ class FloatingBar(QWidget):
             self._transcriber.ai_reformat = ai_reformat
         except Exception as e:
             logger.warning(f"_apply_ai_reformat: {e}")
+
+    def _apply_translate_to(self, translate_to):
+        """Applique translate_to à chaud : via update_settings si dispo, sinon setattr.
+
+        Comme ai_reformat, la langue cible de traduction est lue à l'exécution de
+        transcribe() : nul besoin de recréer le Transcriber, un simple réglage à
+        chaud suffit. On passe TOUJOURS une valeur explicite (None = traduction
+        désactivée, ou un code langue) : c'est la sentinelle interne du moteur qui
+        distingue « ne pas toucher » de « None ». Défensif : le moteur peut ne pas
+        encore connaître le kwarg translate_to (agents parallèles) → repli setattr.
+        """
+        update = getattr(self._transcriber, "update_settings", None)
+        if callable(update):
+            try:
+                update(translate_to=translate_to)
+                return
+            except TypeError:
+                pass  # transitoire : update_settings sans kwarg translate_to
+        # Repli : attribut direct (le moteur expose self.translate_to)
+        try:
+            self._transcriber.translate_to = translate_to
+        except Exception as e:
+            logger.warning(f"_apply_translate_to: {e}")
+
+    def _apply_active_profile(self):
+        """Applique les réglages effectifs selon l'application active (Phase 3b).
+
+        Détecte l'app au premier plan (core.appcontext), résout le profil
+        correspondant (core.profiles) puis calcule les réglages EFFECTIFS =
+        défauts de la config surchargés par le profil. On applique TOUJOURS ces
+        réglages effectifs — profil OU défauts — de sorte qu'en l'ABSENCE de
+        profil correspondant on revienne aux défauts de la config (aucune fuite
+        du profil de la dictée précédente).
+
+        Réglages lus à l'exécution de transcribe() (langue, reformatage, IA,
+        traduction) → applicables à chaud via update_settings ; le modèle exige
+        un rechargement, on ne le change donc QUE s'il diffère réellement
+        (update_model gère déjà l'idempotence).
+
+        Entièrement DÉFENSIF (import différé + try/except larges) : la détection
+        ou l'application d'un profil ne doit JAMAIS empêcher la dictée.
+        """
+        try:
+            from core import appcontext, profiles
+        except Exception as e:
+            logger.debug(f"Profils par app indisponibles (import): {e}")
+            return
+        try:
+            app = appcontext.active_app()
+            prof = profiles.resolve_for_app(app)
+            eff = profiles.effective_settings(self.config, prof)
+        except Exception as e:
+            logger.debug(f"Résolution du profil ignorée: {e}")
+            return
+
+        # Langue + reformatage : hot-swap via update_settings, repli setattr direct
+        # (contrat moteur historique : ces deux réglages existent de longue date).
+        try:
+            update = getattr(self._transcriber, "update_settings", None)
+            if not callable(update):
+                raise AttributeError("update_settings absent")
+            update(language=eff.get("language"), reformatting=eff.get("reformatting"))
+        except Exception:
+            try:
+                lang = eff.get("language")
+                if lang is not None:
+                    self._transcriber.language = None if lang == "auto" else lang
+                reformatting = eff.get("reformatting")
+                if reformatting is not None:
+                    self._transcriber.reformatting = bool(reformatting)
+            except Exception as e:
+                logger.debug(f"language/reformatting (profil) ignorés: {e}")
+
+        # IA + traduction : réutilise les helpers défensifs existants
+        # (update_settings avec repli setattr, tolérants au kwarg absent).
+        self._apply_ai_reformat(bool(eff.get("ai_reformat")))
+        self._apply_translate_to(eff.get("translate_to"))
+
+        # Modèle : ne recharger que s'il change réellement.
+        try:
+            model = eff.get("model")
+            if model and model != getattr(self._transcriber, "model_name", None):
+                self._transcriber.update_model(model)
+        except Exception as e:
+            logger.debug(f"update_model (profil) ignoré: {e}")
 
     def _recreate_transcriber(self):
         """Recrée le Transcriber (backend changé) : unload → new → preload.
@@ -497,6 +600,11 @@ class FloatingBar(QWidget):
                 pass
 
         self._state_signal.emit(self.RECORDING)
+
+        # Profils par application (Phase 3b) : au DÉBUT de la dictée, applique les
+        # réglages effectifs selon l'app au premier plan (profil OU défauts de la
+        # config). Entièrement défensif — ne doit jamais empêcher la dictée.
+        self._apply_active_profile()
 
         try:
             from core.recorder import Recorder
@@ -1079,6 +1187,11 @@ class FloatingBar(QWidget):
             self._transcriber.update_model(new_config.get("model", "small"))
             self._apply_beam_size(new_config.get("beam_size", 1))
             self._apply_ai_reformat(new_config.get("ai_reformat", False))
+            # Traduction à la volée : lue à l'exécution de transcribe(), donc
+            # applicable à chaud (comme ai_reformat). Le cas backend changé passe
+            # par _recreate_transcriber → _build_transcriber, qui repasse déjà
+            # translate_to au constructeur : rien à faire dans cette branche-là.
+            self._apply_translate_to(new_config.get("translate_to"))
 
         # NB : input_device n'exige aucune action ici — il est stocké dans
         # self.config et lu au prochain enregistrement (_on_fn_press).
